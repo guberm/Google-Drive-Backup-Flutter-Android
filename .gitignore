@@ -43,3 +43,88 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Sensitive Data & Configuration Files
+# Google OAuth & API Keys
+google-services.json
+GoogleService-Info.plist
+firebase_options.dart
+*.p8
+*.p12
+*.jks
+*.keystore
+key.properties
+
+# Environment & Configuration Files
+.env
+.env.local
+.env.development
+.env.production
+config.json
+secrets.json
+credentials.json
+service-account-key.json
+
+# API Keys and Tokens
+**/apikey.*
+**/api_key.*
+**/token.*
+**/access_token.*
+**/refresh_token.*
+**/client_secret.*
+**/private_key.*
+
+# Database & Local Storage
+*.db
+*.sqlite
+*.sqlite3
+*.realm
+local.properties
+database.json
+
+# Logs & Debug Files
+*.log
+logs/
+debug/
+crash_logs/
+*.crash
+
+# User-specific Files
+user_preferences.json
+user_data/
+temp_files/
+cache/
+
+# Backup Files
+*.backup
+*.bak
+*.tmp
+*~
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+Thumbs.db
+
+# IDE & Editor Files
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Testing & Coverage
+coverage/
+test_results/
+*.coverage
+lcov.info
+
+# Documentation Build
+docs/_build/
+site/
