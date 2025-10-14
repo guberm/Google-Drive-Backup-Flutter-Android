@@ -53,6 +53,10 @@ class MainActivity : FlutterActivity() {
                     requestBackgroundActivityPermission()
                     result.success(null)
                 }
+                "requestNotificationPermission" -> {
+                    requestNotificationPermission()
+                    result.success(null)
+                }
                 else -> {
                     result.notImplemented()
                 }
@@ -80,7 +84,7 @@ class MainActivity : FlutterActivity() {
 
     private fun showBackupNotification() {
         val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
         }
         val pendingIntent: PendingIntent = PendingIntent.getActivity(
             this, 0, intent, 
@@ -189,6 +193,15 @@ class MainActivity : FlutterActivity() {
                 data = Uri.parse("package:$packageName")
             }
             startActivity(intent)
+        }
+    }
+    
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // For Android 13+ - request notification permission at runtime
+            requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1001)
+        } else {
+            android.util.Log.d("DriveBackup", "Notification permission not required for this Android version")
         }
     }
 

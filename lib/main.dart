@@ -184,6 +184,9 @@ class _BackupHomePageState extends State<BackupHomePage>
     WidgetsBinding.instance.addObserver(this);
     _loadSettings();
 
+    // Check if backup was running when app was closed
+    _restoreBackupState();
+
     // Background permissions will be requested when user starts backup
 
     _googleSignIn.onCurrentUserChanged.listen((account) {
@@ -222,13 +225,13 @@ class _BackupHomePageState extends State<BackupHomePage>
         // App goes to background - backup continues
         if (_isBackingUp) {
           print('App paused - backup continues in background');
+          _saveBackupState();
         }
         break;
       case AppLifecycleState.resumed:
-        // App comes to foreground
-        if (_isBackingUp) {
-          print('App resumed - backup still running');
-        }
+        // App comes to foreground - restore backup state
+        print('App resumed - checking backup state');
+        _restoreBackupState();
         break;
       case AppLifecycleState.detached:
         // App is closing
@@ -239,6 +242,57 @@ class _BackupHomePageState extends State<BackupHomePage>
       default:
         break;
     }
+  }
+
+  // Save backup state when app goes to background
+  Future<void> _saveBackupState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('backup_in_progress', _isBackingUp);
+    await prefs.setInt('total_files', _totalFiles);
+    await prefs.setInt('processed_files', _processedFiles);
+    await prefs.setDouble('progress', _progress);
+    await prefs.setString('current_file_name', _currentFileName);
+    await prefs.setDouble('current_file_progress', _currentFileProgress);
+    await prefs.setInt('current_file_size', _currentFileSize);
+    await prefs.setInt('uploaded_bytes', _uploadedBytes);
+    print('💾 Backup state saved');
+  }
+
+  // Restore backup state when app resumes
+  Future<void> _restoreBackupState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final backupInProgress = prefs.getBool('backup_in_progress') ?? false;
+
+    if (backupInProgress && !_isBackingUp) {
+      print('🔄 Restoring backup state - backup was running in background');
+      setState(() {
+        _isBackingUp = true;
+        _totalFiles = prefs.getInt('total_files') ?? 0;
+        _processedFiles = prefs.getInt('processed_files') ?? 0;
+        _progress = prefs.getDouble('progress') ?? 0.0;
+        _currentFileName = prefs.getString('current_file_name') ?? '';
+        _currentFileProgress = prefs.getDouble('current_file_progress') ?? 0.0;
+        _currentFileSize = prefs.getInt('current_file_size') ?? 0;
+        _uploadedBytes = prefs.getInt('uploaded_bytes') ?? 0;
+        _status = 'Backup in progress...';
+      });
+
+      // The backup progress will update naturally as the background process continues
+    }
+  }
+
+  // Clear backup state when backup completes
+  Future<void> _clearBackupState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('backup_in_progress');
+    await prefs.remove('total_files');
+    await prefs.remove('processed_files');
+    await prefs.remove('progress');
+    await prefs.remove('current_file_name');
+    await prefs.remove('current_file_progress');
+    await prefs.remove('current_file_size');
+    await prefs.remove('uploaded_bytes');
+    print('🗑️ Backup state cleared');
   }
 
   Future<void> _loadSettings() async {
@@ -280,6 +334,9 @@ class _BackupHomePageState extends State<BackupHomePage>
   Future<void> _requestBackgroundPermissions() async {
     try {
       const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+
+      // Request notification permission first (needed for Android 13+)
+      await platform.invokeMethod('requestNotificationPermission');
 
       // Only request battery optimization exemption (less intrusive)
       await platform.invokeMethod('requestBatteryOptimization');
@@ -496,6 +553,9 @@ class _BackupHomePageState extends State<BackupHomePage>
       _skipCurrentFile = false;
     });
 
+    // Save initial backup state
+    _saveBackupState();
+
     // Enable background processing during backup
     await _setWakeLock(true);
 
@@ -550,6 +610,7 @@ class _BackupHomePageState extends State<BackupHomePage>
           _uploadedBytes = 0;
         });
         print('✅ Backup completed successfully: $fileCount files synced');
+        _clearBackupState();
       }
     } catch (e) {
       setState(() {
@@ -562,6 +623,7 @@ class _BackupHomePageState extends State<BackupHomePage>
         _currentFileSize = 0;
         _uploadedBytes = 0;
       });
+      _clearBackupState();
     } finally {
       // Stop heartbeat monitoring
       _syncStoppedManually = true;
@@ -586,6 +648,9 @@ class _BackupHomePageState extends State<BackupHomePage>
       _cancelCurrentFileFlag = false;
       _skipCurrentFile = false;
     });
+
+    // Clear backup state when stopped manually
+    _clearBackupState();
 
     // Release wake lock immediately
     _setWakeLock(false);
