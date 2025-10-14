@@ -20,7 +20,7 @@ dependencies:
   permission_handler: ^11.3.1
   
   # Background tasks
-  workmanager: ^0.5.2
+  workmanager: ^0.9.0
   
   # UI
   file_picker: ^8.1.2

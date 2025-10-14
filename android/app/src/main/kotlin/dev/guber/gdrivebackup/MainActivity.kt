@@ -1,4 +1,4 @@
-package com.example.drive_backup_app
+package dev.guber.gdrivebackup
 
 import io.flutter.embedding.android.FlutterActivity
 

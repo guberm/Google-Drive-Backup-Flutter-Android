@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "dev.guber.gdrivebackup"
-    compileSdk = 34
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -19,9 +19,9 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.drive_backup_app"
+        applicationId = "dev.guber.gdrivebackup"
         minSdk = flutter.minSdkVersion
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
         multiDexEnabled = true
