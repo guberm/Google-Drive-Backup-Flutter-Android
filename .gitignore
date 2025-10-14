@@ -49,6 +49,7 @@ app.*.map.json
 google-services.json
 GoogleService-Info.plist
 firebase_options.dart
+client_secret_*.json
 *.p8
 *.p12
 *.jks

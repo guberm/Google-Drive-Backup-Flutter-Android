@@ -99,11 +99,12 @@ Key packages used in this project:
 
 Common issues and solutions:
 
-- **Google Sign-In fails**: Check OAuth configuration in [`GOOGLE_SIGNIN_SETUP.md`](GOOGLE_SIGNIN_SETUP.md)
+- **Google Sign-In Error (Code 10)**: See [`TROUBLESHOOTING_GOOGLE_SIGNIN.md`](TROUBLESHOOTING_GOOGLE_SIGNIN.md)
+- **OAuth Configuration**: Check setup in [`GOOGLE_SIGNIN_SETUP.md`](GOOGLE_SIGNIN_SETUP.md)
 - **Backup not working**: Verify Google Drive API permissions
 - **File access denied**: Ensure storage permissions are granted
 
-See [`ERROR_10_TROUBLESHOOTING.md`](ERROR_10_TROUBLESHOOTING.md) for detailed troubleshooting guide.
+See [`ERROR_10_TROUBLESHOOTING.md`](ERROR_10_TROUBLESHOOTING.md) for additional troubleshooting.
 
 ## Contributing
 
