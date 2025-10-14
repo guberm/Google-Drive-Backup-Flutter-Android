@@ -3,7 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:permission_handler/permission_handler.dart';
-// import 'package:file_picker/file_picker.dart';  // Temporarily commented out
+import 'package:file_picker/file_picker.dart';
 import 'package:workmanager/workmanager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:io';
@@ -107,6 +107,12 @@ class _MyAppState extends State<MyApp> {
           brightness: Brightness.light,
         ),
         useMaterial3: true,
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            foregroundColor: Colors.white, // White text on light theme
+            backgroundColor: Colors.blue,
+          ),
+        ),
       ),
       darkTheme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -114,6 +120,13 @@ class _MyAppState extends State<MyApp> {
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            foregroundColor: Colors.black, // Black text on dark theme buttons
+            backgroundColor:
+                Colors.lightBlue.shade300, // Lighter blue for visibility
+          ),
+        ),
       ),
       themeMode: _getThemeMode(),
       home: BackupHomePage(
@@ -187,7 +200,8 @@ class _BackupHomePageState extends State<BackupHomePage>
     // Check if backup was running when app was closed
     _restoreBackupState();
 
-    // Background permissions will be requested when user starts backup
+    // Check background permissions at launch
+    _checkBackgroundPermissions();
 
     _googleSignIn.onCurrentUserChanged.listen((account) {
       setState(() {
@@ -330,7 +344,62 @@ class _BackupHomePageState extends State<BackupHomePage>
     }
   }
 
-  // Request background permissions (non-intrusive)
+  // Check if background usage is unrestricted
+  Future<void> _checkBackgroundPermissions() async {
+    try {
+      const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+      final bool isUnrestricted =
+          await platform.invokeMethod('isBackgroundUnrestricted');
+
+      if (!isUnrestricted) {
+        // Show non-intrusive dialog asking for background permissions
+        if (mounted) {
+          _showBackgroundPermissionDialog();
+        }
+      } else {
+        print('✅ Background usage is already unrestricted');
+      }
+    } catch (e) {
+      print('❌ Failed to check background permissions: $e');
+    }
+  }
+
+  // Show dialog asking for unrestricted battery usage
+  void _showBackgroundPermissionDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Unrestricted Battery Usage'),
+          content: const Text(
+            'For reliable backups, this app needs unrestricted battery usage.\n\n'
+            'Please set battery usage to "Unrestricted":\n'
+            '• NOT "Optimized" (default)\n'
+            '• NOT "Restricted"\n'
+            '• SET TO "Unrestricted" ✓\n\n'
+            'This ensures backups continue reliably in the background.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('Later'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _requestBackgroundPermissions();
+              },
+              child: const Text('Open Battery Settings'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Request background permissions for unrestricted battery usage
   Future<void> _requestBackgroundPermissions() async {
     try {
       const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
@@ -338,12 +407,12 @@ class _BackupHomePageState extends State<BackupHomePage>
       // Request notification permission first (needed for Android 13+)
       await platform.invokeMethod('requestNotificationPermission');
 
-      // Only request battery optimization exemption (less intrusive)
-      await platform.invokeMethod('requestBatteryOptimization');
+      // Request unrestricted battery usage (not just optimization exemption)
+      await platform.invokeMethod('requestUnrestrictedBattery');
 
-      print('✅ Background permission request sent');
+      print('✅ Unrestricted battery usage request sent');
     } catch (e) {
-      print('❌ Failed to request background permissions: $e');
+      print('❌ Failed to request unrestricted battery usage: $e');
     }
   }
 
@@ -378,9 +447,45 @@ class _BackupHomePageState extends State<BackupHomePage>
       await Permission.storage.request();
     }
 
-    // For Android 11+ (API 30+)
+    // For Android 11+ (API 30+) - needed for Downloads folder access
     if (await Permission.manageExternalStorage.isDenied) {
-      await Permission.manageExternalStorage.request();
+      // Show explanation before requesting MANAGE_EXTERNAL_STORAGE
+      if (mounted) {
+        final shouldRequest = await showDialog<bool>(
+          context: context,
+          builder: (BuildContext context) {
+            return AlertDialog(
+              title: const Text('Storage Permission'),
+              content: const Text(
+                'To access the Downloads folder and other system directories, '
+                'this app needs "All files access" permission.\n\n'
+                'This allows you to backup any folder on your device.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.of(context).pop(true),
+                  child: const Text('Grant Permission'),
+                ),
+              ],
+            );
+          },
+        );
+
+        if (shouldRequest == true) {
+          // Use native method for better handling
+          try {
+            const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+            await platform.invokeMethod('requestStoragePermission');
+          } catch (e) {
+            // Fallback to permission_handler
+            await Permission.manageExternalStorage.request();
+          }
+        }
+      }
     }
   }
 
@@ -496,15 +601,111 @@ class _BackupHomePageState extends State<BackupHomePage>
   Future<void> _selectFolder() async {
     await _requestPermissions();
 
-    // String? selectedDirectory = await FilePicker.platform.getDirectoryPath();  // Temporarily commented out
-    String? selectedDirectory =
-        "/storage/emulated/0/Download"; // Temporary hardcoded path for testing
+    // Show folder selection options including common system folders
+    final selectedOption = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Select Backup Folder'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Choose a folder to backup:'),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.download),
+                title: const Text('Downloads'),
+                subtitle: const Text('/storage/emulated/0/Download'),
+                onTap: () =>
+                    Navigator.of(context).pop('/storage/emulated/0/Download'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.photo),
+                title: const Text('Pictures'),
+                subtitle: const Text('/storage/emulated/0/Pictures'),
+                onTap: () =>
+                    Navigator.of(context).pop('/storage/emulated/0/Pictures'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.video_library),
+                title: const Text('Movies'),
+                subtitle: const Text('/storage/emulated/0/Movies'),
+                onTap: () =>
+                    Navigator.of(context).pop('/storage/emulated/0/Movies'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.library_music),
+                title: const Text('Music'),
+                subtitle: const Text('/storage/emulated/0/Music'),
+                onTap: () =>
+                    Navigator.of(context).pop('/storage/emulated/0/Music'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.insert_drive_file),
+                title: const Text('Documents'),
+                subtitle: const Text('/storage/emulated/0/Documents'),
+                onTap: () =>
+                    Navigator.of(context).pop('/storage/emulated/0/Documents'),
+              ),
+              const Divider(),
+              ListTile(
+                leading: const Icon(Icons.folder_open),
+                title: const Text('Browse for other folder'),
+                subtitle: const Text('Use file picker'),
+                onTap: () => Navigator.of(context).pop('BROWSE'),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
 
-    setState(() {
-      _selectedFolderPath = selectedDirectory;
-      _status = 'Folder selected: ${path.basename(selectedDirectory)}';
-    });
-    await _saveSettings();
+    if (selectedOption != null) {
+      if (selectedOption == 'BROWSE') {
+        // Use file picker for custom folder selection
+        String? selectedDirectory =
+            await FilePicker.platform.getDirectoryPath();
+        if (selectedDirectory != null) {
+          setState(() {
+            _selectedFolderPath = selectedDirectory;
+            _status = 'Folder selected: ${path.basename(selectedDirectory)}';
+          });
+          await _saveSettings();
+        }
+      } else {
+        // Use preset system folder
+        // Verify the folder exists
+        final directory = Directory(selectedOption);
+        if (await directory.exists()) {
+          setState(() {
+            _selectedFolderPath = selectedOption;
+            _status = 'Folder selected: ${path.basename(selectedOption)}';
+          });
+          await _saveSettings();
+        } else {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                  content: Text(
+                      'Folder not found: ${path.basename(selectedOption)}')),
+            );
+          }
+        }
+      }
+    } else {
+      // User canceled selection, show message if no folder is selected
+      if (_selectedFolderPath == null) {
+        setState(() {
+          _status = 'No folder selected';
+        });
+      }
+    }
   }
 
   Future<void> _performBackup() async {
@@ -591,12 +792,18 @@ class _BackupHomePageState extends State<BackupHomePage>
       final driveApi = drive.DriveApi(authenticateClient);
 
       // Get or create backup folder
-      final folderId = await _getOrCreateDriveFolder(driveApi, 'AppBackup');
+      final appBackupFolderId =
+          await _getOrCreateDriveFolder(driveApi, 'AppBackup');
+
+      // Create subfolder with the name of the selected folder
+      final selectedFolderName = path.basename(_selectedFolderPath!);
+      final targetFolderId = await _getOrCreateDriveFolder(
+          driveApi, selectedFolderName, appBackupFolderId);
 
       // Backup files with progress tracking
       print(
-          '🚀 Starting backup of $_totalFiles files from $_selectedFolderPath');
-      int fileCount = await _backupDirectory(driveApi, folder, folderId);
+          '🚀 Starting backup of $_totalFiles files from $_selectedFolderPath to Google Drive folder: $selectedFolderName');
+      int fileCount = await _backupDirectory(driveApi, folder, targetFolderId);
 
       if (!_syncStoppedManually) {
         setState(() {
@@ -684,11 +891,19 @@ class _BackupHomePageState extends State<BackupHomePage>
 
   Future<String> _getOrCreateDriveFolder(
     drive.DriveApi driveApi,
-    String folderName,
-  ) async {
+    String folderName, [
+    String? parentId,
+  ]) async {
     try {
+      // Build query to include parent folder if specified
+      String query =
+          "name='$folderName' and mimeType='application/vnd.google-apps.folder' and trashed=false";
+      if (parentId != null) {
+        query += " and '$parentId' in parents";
+      }
+
       final fileList = await driveApi.files.list(
-        q: "name='$folderName' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        q: query,
         spaces: 'drive',
         $fields: 'files(id, name)',
       );
@@ -697,11 +912,19 @@ class _BackupHomePageState extends State<BackupHomePage>
         return fileList.files!.first.id!;
       }
 
+      // Create new folder
       final folder = drive.File()
         ..name = folderName
         ..mimeType = 'application/vnd.google-apps.folder';
 
+      // Set parent folder if specified
+      if (parentId != null) {
+        folder.parents = [parentId];
+      }
+
       final createdFolder = await driveApi.files.create(folder);
+      print(
+          '📁 Created Google Drive folder: $folderName ${parentId != null ? "inside parent folder" : "at root"}');
       return createdFolder.id!;
     } catch (e) {
       print('Error creating folder: $e');
@@ -1421,8 +1644,7 @@ class _BackupHomePageState extends State<BackupHomePage>
                             .colorScheme
                             .surfaceContainerHighest,
                         valueColor: AlwaysStoppedAnimation<Color>(
-                          Theme.of(context).colorScheme.primary,
-                        ),
+                            Theme.of(context).colorScheme.primary),
                       ),
                       const SizedBox(height: 4),
                       Text(
@@ -1460,9 +1682,11 @@ class _BackupHomePageState extends State<BackupHomePage>
                         // File progress bar
                         LinearProgressIndicator(
                           value: _currentFileProgress,
-                          backgroundColor: Colors.grey.shade300,
-                          valueColor:
-                              const AlwaysStoppedAnimation<Color>(Colors.green),
+                          backgroundColor: Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerHighest,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                              Theme.of(context).colorScheme.primary),
                         ),
                         const SizedBox(height: 4),
                         Row(
@@ -1486,12 +1710,10 @@ class _BackupHomePageState extends State<BackupHomePage>
                             Expanded(
                               child: ElevatedButton.icon(
                                 onPressed: _cancelCurrentFile,
-                                icon: const Icon(Icons.cancel,
-                                    size: 16, color: Colors.white),
+                                icon: const Icon(Icons.cancel, size: 16),
                                 label: const Text('Cancel File',
-                                    style: TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.w600)),
+                                    style:
+                                        TextStyle(fontWeight: FontWeight.w600)),
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.red.shade600,
                                   foregroundColor: Colors.white,
@@ -1505,12 +1727,10 @@ class _BackupHomePageState extends State<BackupHomePage>
                             Expanded(
                               child: ElevatedButton.icon(
                                 onPressed: _skipCurrentFileUpload,
-                                icon: const Icon(Icons.skip_next,
-                                    size: 16, color: Colors.white),
+                                icon: const Icon(Icons.skip_next, size: 16),
                                 label: const Text('Skip File',
-                                    style: TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.w600)),
+                                    style:
+                                        TextStyle(fontWeight: FontWeight.w600)),
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.orange.shade600,
                                   foregroundColor: Colors.white,

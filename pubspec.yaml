@@ -23,7 +23,7 @@ dependencies:
   workmanager: ^0.9.0
   
   # UI & Utilities
-  # file_picker: ^5.5.0  # Temporarily commented out due to plugin issues
+  file_picker: ^8.1.2
   shared_preferences: ^2.3.2
   path: ^1.9.0
   http: ^1.2.2

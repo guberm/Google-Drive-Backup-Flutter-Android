@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
@@ -55,6 +56,18 @@ class MainActivity : FlutterActivity() {
                 }
                 "requestNotificationPermission" -> {
                     requestNotificationPermission()
+                    result.success(null)
+                }
+                "isBackgroundUnrestricted" -> {
+                    val isUnrestricted = isBackgroundUnrestricted()
+                    result.success(isUnrestricted)
+                }
+                "requestStoragePermission" -> {
+                    requestStoragePermission()
+                    result.success(null)
+                }
+                "requestUnrestrictedBattery" -> {
+                    requestUnrestrictedBatteryUsage()
                     result.success(null)
                 }
                 else -> {
@@ -175,13 +188,28 @@ class MainActivity : FlutterActivity() {
             val packageName = packageName
             
             if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
-                // Only log the request - don't automatically open settings
-                android.util.Log.d("DriveBackup", "Battery optimization exemption not granted - backup may be limited in background")
+                android.util.Log.d("DriveBackup", "Requesting unrestricted battery usage for reliable backups")
                 
-                // Optionally, could show a non-intrusive notification instead of opening settings
-                // User can manually grant permission if they want via device settings
+                try {
+                    // Request unrestricted battery usage (not just exemption from optimization)
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    android.util.Log.w("DriveBackup", "Could not open battery settings, trying app-specific settings", e)
+                    // Fallback to app-specific settings
+                    try {
+                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.parse("package:$packageName")
+                        }
+                        startActivity(intent)
+                    } catch (e2: Exception) {
+                        android.util.Log.e("DriveBackup", "Could not open any battery settings", e2)
+                    }
+                }
             } else {
-                android.util.Log.d("DriveBackup", "Battery optimization already exempted - background backup should work well")
+                android.util.Log.d("DriveBackup", "Battery optimization already disabled - background backup should work well")
             }
         }
     }
@@ -202,6 +230,84 @@ class MainActivity : FlutterActivity() {
             requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1001)
         } else {
             android.util.Log.d("DriveBackup", "Notification permission not required for this Android version")
+        }
+    }
+    
+    private fun requestStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ - request MANAGE_EXTERNAL_STORAGE permission
+            if (!Environment.isExternalStorageManager()) {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Android 6-10 - request standard storage permissions
+            requestPermissions(arrayOf(
+                "android.permission.READ_EXTERNAL_STORAGE",
+                "android.permission.WRITE_EXTERNAL_STORAGE"
+            ), 1002)
+        }
+    }
+    
+    private fun isBackgroundUnrestricted(): Boolean {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        
+        return when {
+            Build.VERSION.SDK_INT >= 35 -> {
+                // Android 15+ (API 35) - stricter background processing
+                val batteryOptimized = powerManager.isIgnoringBatteryOptimizations(packageName)
+                val backgroundAllowed = isBackgroundAppRefreshEnabled()
+                batteryOptimized && backgroundAllowed
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
+                // Android 6-14 - check battery optimization
+                powerManager.isIgnoringBatteryOptimizations(packageName)
+            }
+            else -> {
+                // Older Android versions
+                true
+            }
+        }
+    }
+    
+    private fun requestUnrestrictedBatteryUsage() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                android.util.Log.d("DriveBackup", "Opening battery settings to set unrestricted usage")
+                
+                // Direct intent to request ignoring battery optimizations (unrestricted mode)
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                android.util.Log.w("DriveBackup", "Could not open battery optimization request", e)
+                // Fallback to general app settings where user can set battery to unrestricted
+                try {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (e2: Exception) {
+                    android.util.Log.e("DriveBackup", "Could not open app settings", e2)
+                }
+            }
+        }
+    }
+    
+    private fun isBackgroundAppRefreshEnabled(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                return !activityManager.isBackgroundRestricted
+            } else {
+                return true
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("DriveBackup", "Could not check background app refresh status", e)
+            return true
         }
     }
 
