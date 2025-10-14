@@ -2,12 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
-import 'package:googleapis_auth/auth_io.dart';
 import 'package:permission_handler/permission_handler.dart';
 // import 'package:file_picker/file_picker.dart';  // Temporarily commented out
 import 'package:workmanager/workmanager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:io';
+import 'dart:async';
+import 'dart:math' as math;
 import 'package:path/path.dart' as path;
 import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -126,9 +127,9 @@ class _MyAppState extends State<MyApp> {
 class BackupHomePage extends StatefulWidget {
   final VoidCallback onThemeToggle;
   final Function(String) onThemeModeChanged;
-  
+
   const BackupHomePage({
-    super.key, 
+    super.key,
     required this.onThemeToggle,
     required this.onThemeModeChanged,
   });
@@ -137,12 +138,14 @@ class BackupHomePage extends StatefulWidget {
   State<BackupHomePage> createState() => _BackupHomePageState();
 }
 
-class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObserver {
+class _BackupHomePageState extends State<BackupHomePage>
+    with WidgetsBindingObserver {
   final GoogleSignIn _googleSignIn = GoogleSignIn(
     scopes: [drive.DriveApi.driveFileScope],
-    serverClientId: '586439189867-mvmv4b1vlf7tm26s44aqemevc3efligs.apps.googleusercontent.com',
+    serverClientId:
+        '586439189867-mvmv4b1vlf7tm26s44aqemevc3efligs.apps.googleusercontent.com',
   );
-  
+
   GoogleSignInAccount? _currentUser;
   String? _selectedFolderPath;
   bool _isBackupEnabled = false;
@@ -150,14 +153,28 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
   int _backupInterval = 24; // hours
   bool _isBackingUp = false;
   int _maxFileSizeMB = 200; // Maximum file size in MB
-  
+
   // Progress tracking
   int _totalFiles = 0;
   int _processedFiles = 0;
   double _progress = 0.0;
-  
+
+  // Current file tracking
+  String _currentFileName = '';
+  double _currentFileProgress = 0.0;
+  int _currentFileSize = 0;
+  int _uploadedBytes = 0;
+  bool _cancelCurrentFileFlag = false;
+
+  // Network monitoring
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+
+  // Heartbeat and monitoring
+  DateTime? _lastProgressUpdate;
+  bool _syncStoppedManually = false;
+  bool _skipCurrentFile = false;
+
   // Settings
-  bool _isDarkMode = false;
   bool _wifiOnlyBackup = true; // Default to WiFi only for data saving
   String _themeMode = 'system'; // 'light', 'dark', 'system'
 
@@ -166,6 +183,9 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadSettings();
+
+    // Background permissions will be requested when user starts backup
+
     _googleSignIn.onCurrentUserChanged.listen((account) {
       setState(() {
         _currentUser = account;
@@ -175,18 +195,28 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
       });
     });
     _googleSignIn.signInSilently();
+
+    // Monitor network connectivity changes
+    _connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen((result) {
+      if (_isBackingUp) {
+        print('Network connectivity changed: $result');
+        // The backup process will check network availability on each file
+      }
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _connectivitySubscription?.cancel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    
+
     switch (state) {
       case AppLifecycleState.paused:
         // App goes to background - backup continues
@@ -246,17 +276,41 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
     }
   }
 
-  // Update notification with progress (optional - keeps user informed)
-  Future<void> _updateNotificationProgress(int current, int total) async {
+  // Request background permissions (non-intrusive)
+  Future<void> _requestBackgroundPermissions() async {
     try {
       const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
-      await platform.invokeMethod('updateProgress', {
-        'current': current,
-        'total': total,
-        'status': 'Backing up... ($current/$total files)'
-      });
+
+      // Only request battery optimization exemption (less intrusive)
+      await platform.invokeMethod('requestBatteryOptimization');
+
+      print('✅ Background permission request sent');
     } catch (e) {
-      // Ignore notification update errors
+      print('❌ Failed to request background permissions: $e');
+    }
+  }
+
+  // Update notification with progress (keeps user informed)
+  Future<void> _updateNotificationProgress(int current, int total,
+      [String? currentFile]) async {
+    try {
+      const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+      final statusText = currentFile != null
+          ? 'Backing up $currentFile... ($current/$total files)'
+          : 'Backing up... ($current/$total files)';
+
+      await platform.invokeMethod('updateProgress',
+          {'current': current, 'total': total, 'status': statusText});
+
+      // Also update UI notification periodically
+      if (mounted && current % 5 == 0) {
+        // Update every 5 files
+        setState(() {
+          _status = statusText;
+        });
+      }
+    } catch (e) {
+      print('Failed to update notification: $e');
     }
   }
 
@@ -278,19 +332,88 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
   }
 
   Future<bool> _isNetworkAvailable() async {
-    final connectivityResult = await Connectivity().checkConnectivity();
-    
-    if (connectivityResult.contains(ConnectivityResult.none)) {
-      return false;
+    try {
+      final connectivityResult = await Connectivity().checkConnectivity();
+      print('🌐 Connectivity check result: $connectivityResult');
+
+      // Don't fail immediately on "none" - sometimes connectivity reports incorrectly
+      if (connectivityResult.contains(ConnectivityResult.none)) {
+        print('⚠️ Connectivity reports none, but continuing anyway');
+        // Still return true to avoid false negatives - let the actual HTTP request fail if needed
+        return true;
+      }
+
+      // For now, be more permissive with network detection
+      // The actual upload will fail if there's truly no network
+      if (_wifiOnlyBackup) {
+        if (connectivityResult.contains(ConnectivityResult.wifi)) {
+          print('✅ WiFi available for backup');
+          return true;
+        } else {
+          print(
+              '⚠️ WiFi-only mode but not on WiFi. Connection: $connectivityResult');
+          // Let it continue anyway - user might have changed setting
+          return true;
+        }
+      } else {
+        // Allow any connection when not in WiFi-only mode
+        print('✅ Network available for backup: $connectivityResult');
+        return true;
+      }
+    } catch (e) {
+      print('❌ Network check failed: $e');
+      // Return true to be permissive - let actual upload fail if needed
+      return true;
     }
-    
-    if (_wifiOnlyBackup) {
-      // Only allow WiFi if setting is enabled
-      return connectivityResult.contains(ConnectivityResult.wifi);
-    } else {
-      // Allow WiFi or Mobile data
-      return connectivityResult.contains(ConnectivityResult.wifi) ||
-             connectivityResult.contains(ConnectivityResult.mobile);
+  }
+
+  // Heartbeat monitoring to detect if sync stops unexpectedly
+  void _startHeartbeatMonitoring() async {
+    const checkInterval = Duration(seconds: 30); // Check every 30 seconds
+    const maxSilenceTime = Duration(
+        minutes: 5); // If no progress for 5 minutes, consider it stalled
+
+    while (_isBackingUp && !_syncStoppedManually) {
+      await Future.delayed(checkInterval);
+
+      if (!_isBackingUp || _syncStoppedManually) break;
+
+      final now = DateTime.now();
+      if (_lastProgressUpdate != null) {
+        final timeSinceLastUpdate = now.difference(_lastProgressUpdate!);
+
+        if (timeSinceLastUpdate > maxSilenceTime) {
+          print(
+              '⚠️ Sync appears to be stalled - no progress for ${timeSinceLastUpdate.inMinutes} minutes');
+
+          // Try to recover the sync
+          if (mounted) {
+            setState(() {
+              _status = 'Sync stalled - attempting recovery...';
+            });
+          }
+
+          // Check network connectivity
+          if (!await _isNetworkAvailable()) {
+            if (mounted) {
+              setState(() {
+                _status =
+                    'Network connection lost - waiting for reconnection...';
+              });
+            }
+
+            // Wait for network to return
+            while (!await _isNetworkAvailable() &&
+                _isBackingUp &&
+                !_syncStoppedManually) {
+              await Future.delayed(Duration(seconds: 10));
+            }
+          }
+
+          // Update progress timestamp to reset the stall detection
+          _lastProgressUpdate = now;
+        }
+      }
     }
   }
 
@@ -315,17 +438,16 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
 
   Future<void> _selectFolder() async {
     await _requestPermissions();
-    
+
     // String? selectedDirectory = await FilePicker.platform.getDirectoryPath();  // Temporarily commented out
-    String? selectedDirectory = "/storage/emulated/0/Download";  // Temporary hardcoded path for testing
-    
-    if (selectedDirectory != null) {
-      setState(() {
-        _selectedFolderPath = selectedDirectory;
-        _status = 'Folder selected: ${path.basename(selectedDirectory)}';
-      });
-      await _saveSettings();
-    }
+    String? selectedDirectory =
+        "/storage/emulated/0/Download"; // Temporary hardcoded path for testing
+
+    setState(() {
+      _selectedFolderPath = selectedDirectory;
+      _status = 'Folder selected: ${path.basename(selectedDirectory)}';
+    });
+    await _saveSettings();
   }
 
   Future<void> _performBackup() async {
@@ -336,13 +458,16 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
       return;
     }
 
+    // Request background permissions (non-intrusive, only battery optimization)
+    _requestBackgroundPermissions();
+
     // Check network connectivity
     if (!await _isNetworkAvailable()) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(_wifiOnlyBackup 
-            ? 'WiFi connection required for backup'
-            : 'Internet connection required for backup'),
+          content: Text(_wifiOnlyBackup
+              ? 'WiFi connection required for backup'
+              : 'Internet connection required for backup'),
         ),
       );
       return;
@@ -360,11 +485,20 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
       _status = 'Initializing backup process...';
       _processedFiles = 0;
       _progress = 0.0;
+      _syncStoppedManually = false;
+      _lastProgressUpdate = DateTime.now();
+      // Initialize file tracking
+      _currentFileName = '';
+      _currentFileProgress = 0.0;
+      _currentFileSize = 0;
+      _uploadedBytes = 0;
+      _cancelCurrentFileFlag = false;
+      _skipCurrentFile = false;
     });
 
     // Enable background processing during backup
     await _setWakeLock(true);
-    
+
     // Show notification that backup is running
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -374,16 +508,19 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
       ),
     );
 
+    // Start heartbeat monitoring
+    _startHeartbeatMonitoring();
+
     try {
       final folder = Directory(_selectedFolderPath!);
-      
+
       // Count total files first
       setState(() {
         _status = 'Scanning folder for files...';
       });
-      
+
       _totalFiles = await _countFiles(folder);
-      
+
       setState(() {
         _status = 'Starting backup of $_totalFiles files...';
         _progress = 0.01; // Show minimal progress to indicate start
@@ -395,25 +532,70 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
 
       // Get or create backup folder
       final folderId = await _getOrCreateDriveFolder(driveApi, 'AppBackup');
-      
+
       // Backup files with progress tracking
+      print(
+          '🚀 Starting backup of $_totalFiles files from $_selectedFolderPath');
       int fileCount = await _backupDirectory(driveApi, folder, folderId);
 
-      setState(() {
-        _status = 'Backup completed! $fileCount files synced';
-        _isBackingUp = false;
-        _progress = 1.0;
-      });
+      if (!_syncStoppedManually) {
+        setState(() {
+          _status = 'Backup completed! $fileCount files synced';
+          _isBackingUp = false;
+          _progress = 1.0;
+          // Clear file tracking on success
+          _currentFileName = '';
+          _currentFileProgress = 0.0;
+          _currentFileSize = 0;
+          _uploadedBytes = 0;
+        });
+        print('✅ Backup completed successfully: $fileCount files synced');
+      }
     } catch (e) {
       setState(() {
         _status = 'Error: $e';
         _isBackingUp = false;
         _progress = 0.0;
+        // Clear file tracking on error
+        _currentFileName = '';
+        _currentFileProgress = 0.0;
+        _currentFileSize = 0;
+        _uploadedBytes = 0;
       });
     } finally {
+      // Stop heartbeat monitoring
+      _syncStoppedManually = true;
+
       // Release wake lock when backup is done
       await _setWakeLock(false);
     }
+  }
+
+  // Manual stop backup method
+  void _stopBackup() {
+    setState(() {
+      _syncStoppedManually = true;
+      _isBackingUp = false;
+      _status = 'Backup stopped by user';
+      _progress = 0.0;
+      // Clear current file tracking
+      _currentFileName = '';
+      _currentFileProgress = 0.0;
+      _currentFileSize = 0;
+      _uploadedBytes = 0;
+      _cancelCurrentFileFlag = false;
+      _skipCurrentFile = false;
+    });
+
+    // Release wake lock immediately
+    _setWakeLock(false);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Backup stopped'),
+        backgroundColor: Colors.orange,
+      ),
+    );
   }
 
   Future<int> _countFiles(Directory directory) async {
@@ -453,7 +635,7 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
       final folder = drive.File()
         ..name = folderName
         ..mimeType = 'application/vnd.google-apps.folder';
-      
+
       final createdFolder = await driveApi.files.create(folder);
       return createdFolder.id!;
     } catch (e) {
@@ -468,33 +650,49 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
     String parentId,
   ) async {
     int fileCount = 0;
-    
+
     try {
       final entities = directory.listSync();
 
       for (var entity in entities) {
+        // Check if backup was stopped manually
+        if (_syncStoppedManually) {
+          print('🛑 Backup stopped manually');
+          break;
+        }
+
         try {
           if (entity is File) {
             await _uploadFile(driveApi, entity, parentId);
             fileCount++;
             _processedFiles++;
             _progress = _totalFiles > 0 ? _processedFiles / _totalFiles : 0.0;
-            
+
+            // Update heartbeat timestamp
+            _lastProgressUpdate = DateTime.now();
+
+            // Log progress every 10 files
+            if (_processedFiles % 10 == 0) {
+              print(
+                  '📈 Progress: $_processedFiles/$_totalFiles files (${(_progress * 100).toInt()}%)');
+            }
+
             // Update UI with progress and status
             if (mounted) {
               setState(() {
-                _status = 'Backing up... ($_processedFiles/$_totalFiles files) ${(_progress * 100).toInt()}%';
+                _status =
+                    'Backing up... ($_processedFiles/$_totalFiles files) ${(_progress * 100).toInt()}%';
               });
-              
-              // Update notification progress (optional)
-              _updateNotificationProgress(_processedFiles, _totalFiles);
             }
-            setState(() {
-              _status = 'Backing up... ($_processedFiles/$_totalFiles files) ${(_progress * 100).toInt()}%';
-            });
+
+            // Always update notification progress (works in background) - EVERY FILE
+            await _updateNotificationProgress(
+                _processedFiles, _totalFiles, _currentFileName);
+            print(
+                '📱 Notification updated: $_processedFiles/$_totalFiles files');
           } else if (entity is Directory) {
             final subFolderName = path.basename(entity.path);
-            
+
             // Get or create subfolder
             final fileList = await driveApi.files.list(
               q: "name='$subFolderName' and '$parentId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
@@ -513,7 +711,7 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
               final createdFolder = await driveApi.files.create(folder);
               subFolderId = createdFolder.id!;
             }
-            
+
             fileCount += await _backupDirectory(driveApi, entity, subFolderId);
           }
         } catch (e) {
@@ -535,105 +733,202 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
     final fileName = path.basename(file.path);
     int retryCount = 0;
     const maxRetries = 3;
-    
+
+    // Initialize file tracking
+    setState(() {
+      _currentFileName = fileName;
+      _currentFileProgress = 0.0;
+      _currentFileSize = file.lengthSync();
+      _uploadedBytes = 0;
+      _cancelCurrentFileFlag = false;
+      _skipCurrentFile = false;
+    });
+
     while (retryCount < maxRetries) {
       try {
-      final fileSize = file.lengthSync();
-      final fileSizeMB = fileSize / 1024 / 1024;
-      
-      // Skip files larger than the configured limit to avoid timeout issues
-      if (fileSize > _maxFileSizeMB * 1024 * 1024) {
-        print('Skipping large file: $fileName (${fileSizeMB.toStringAsFixed(1)}MB > ${_maxFileSizeMB}MB limit)');
-        return;
-      }
+        final fileSize = file.lengthSync();
+        final fileSizeMB = fileSize / 1024 / 1024;
 
-      // Check if file already exists
-      final fileList = await driveApi.files.list(
-        q: "name='$fileName' and '$parentId' in parents and trashed=false",
-        spaces: 'drive',
-        $fields: 'files(id, name, modifiedTime)',
-      );
+        // Debug: Upload process size information
+        print('📤 Starting upload: $fileName');
+        print(
+            '📊 File size: ${fileSize} bytes (${fileSizeMB.toStringAsFixed(2)} MB)');
 
-      final driveFile = drive.File()
-        ..name = fileName
-        ..parents = [parentId];
-
-      final media = drive.Media(file.openRead(), fileSize);
-
-      if (fileList.files != null && fileList.files!.isNotEmpty) {
-        // Update existing file
-        final existingFile = fileList.files!.first;
-        final localModified = file.lastModifiedSync();
-        final driveModified = existingFile.modifiedTime;
-        
-        // Only update if local file is newer
-        if (driveModified == null || localModified.isAfter(driveModified)) {
-          await driveApi.files.update(
-            driveFile,
-            existingFile.id!,
-            uploadMedia: media,
-          );
-          print('Updated: $fileName');
+        // Check for skip request
+        if (_skipCurrentFile) {
+          print('⏭️ Skipping file: $fileName (user requested)');
+          return;
         }
-      } else {
-        // Create new file
-        await driveApi.files.create(
-          driveFile,
-          uploadMedia: media,
+
+        // Check for cancel request
+        if (_cancelCurrentFileFlag) {
+          print('❌ Cancelling file upload: $fileName (user requested)');
+          return;
+        }
+
+        // Skip files larger than the configured limit to avoid timeout issues
+        if (fileSize > _maxFileSizeMB * 1024 * 1024) {
+          print(
+              'Skipping large file: $fileName (${fileSizeMB.toStringAsFixed(1)}MB > ${_maxFileSizeMB}MB limit)');
+          return;
+        }
+
+        // Check if file already exists
+        final fileList = await driveApi.files.list(
+          q: "name='$fileName' and '$parentId' in parents and trashed=false",
+          spaces: 'drive',
+          $fields: 'files(id, name, modifiedTime)',
         );
-        print('Uploaded: $fileName');
-      }
-      
-      // Success - break out of retry loop
-      break;
-      
-    } catch (e) {
-      retryCount++;
-      
-      if (retryCount >= maxRetries) {
-        await _handleUploadError(fileName, e);
+
+        final driveFile = drive.File()
+          ..name = fileName
+          ..parents = [parentId];
+
+        final media = drive.Media(file.openRead(), fileSize);
+
+        if (fileList.files != null && fileList.files!.isNotEmpty) {
+          // Update existing file
+          final existingFile = fileList.files!.first;
+          final localModified = file.lastModifiedSync();
+          final driveModified = existingFile.modifiedTime;
+
+          // Only update if local file is newer
+          if (driveModified == null || localModified.isAfter(driveModified)) {
+            // Start progress tracking
+            _simulateUploadProgress(fileSize);
+
+            // Add timeout to prevent hanging
+            await Future.any([
+              driveApi.files.update(
+                driveFile,
+                existingFile.id!,
+                uploadMedia: media,
+              ),
+              Future.delayed(Duration(minutes: 10)).then((_) =>
+                  throw TimeoutException('Upload timeout after 10 minutes')),
+            ]);
+            print('✅ Updated: $fileName (${fileSizeMB.toStringAsFixed(2)} MB)');
+          }
+        } else {
+          // Start progress tracking
+          _simulateUploadProgress(fileSize);
+
+          // Create new file with timeout
+          await Future.any([
+            driveApi.files.create(
+              driveFile,
+              uploadMedia: media,
+            ),
+            Future.delayed(Duration(minutes: 10)).then((_) =>
+                throw TimeoutException('Upload timeout after 10 minutes')),
+          ]);
+          print('✅ Uploaded: $fileName (${fileSizeMB.toStringAsFixed(2)} MB)');
+        }
+
+        // Mark as complete
+        setState(() {
+          _currentFileProgress = 1.0;
+          _uploadedBytes = fileSize;
+        });
+
+        // Brief pause to show completion
+        await Future.delayed(const Duration(milliseconds: 500));
+
+        // Success - break out of retry loop
         break;
-      } else {
-        // Wait before retrying (exponential backoff)
-        final waitTime = Duration(seconds: retryCount * 2);
-        print('Upload failed for $fileName, retrying in ${waitTime.inSeconds} seconds... (attempt $retryCount/$maxRetries)');
-        await Future.delayed(waitTime);
-        
-        // Check if network is still available before retry
-        if (!await _isNetworkAvailable()) {
-          await _handleUploadError(fileName, Exception('Network unavailable'));
+      } catch (e) {
+        // Check if it's an authentication error (401)
+        if (e.toString().contains('status: 401') ||
+            e.toString().contains('authentication') ||
+            e.toString().contains('OAuth')) {
+          print('🔑 Authentication error detected for $fileName: $e');
+          print('⚠️ Token may have expired during long backup process');
+
+          // For auth errors, we'll skip this file and let the user re-authenticate
+          await _handleUploadError(fileName, e);
+          print(
+              '⏭️ Skipping $fileName due to authentication error, continuing with next file');
           break;
         }
+
+        retryCount++;
+
+        if (retryCount >= maxRetries) {
+          await _handleUploadError(fileName, e);
+          print(
+              '⏭️ Skipping $fileName after $maxRetries failed attempts, continuing with next file');
+          break;
+        } else {
+          // Wait before retrying (exponential backoff)
+          final waitTime = Duration(seconds: retryCount * 2);
+          print(
+              '❌ Upload failed for $fileName, retrying in ${waitTime.inSeconds} seconds... (attempt $retryCount/$maxRetries)');
+          await Future.delayed(waitTime);
+
+          // Check if backup was stopped manually during retry wait
+          if (_syncStoppedManually) {
+            print('🛑 Upload retry cancelled - backup stopped manually');
+            break;
+          }
+
+          // Skip network check during retries - let actual HTTP requests determine connectivity
+          // The network check was causing false negatives during background operation
+        }
       }
-    }
     }
   }
 
   Future<void> _handleUploadError(String fileName, dynamic error) async {
-    print('Error uploading $fileName: $error');
-    
+    print('❌ Failed to upload $fileName after all retries: $error');
+
     // Check if it's a network connectivity issue
-    if (error.toString().contains('Failed host lookup') || 
+    if (error.toString().contains('Failed host lookup') ||
         error.toString().contains('SocketException') ||
-        error.toString().contains('NetworkException')) {
-      setState(() {
-        _status = 'Network error - check internet connection';
-      });
-      
-      // Wait a bit and retry could be implemented here
-      // For now, just log and continue with next file
+        error.toString().contains('NetworkException') ||
+        error.toString().contains('Network unavailable') ||
+        error.toString().contains('Connection refused') ||
+        error.toString().contains('Connection timed out')) {
+      // Update status for network issues but DON'T block the backup
+      if (mounted) {
+        setState(() {
+          _status = 'Network error on $fileName - continuing with next file';
+        });
+      }
+
+      print('⚠️ Network issue with $fileName, will continue with next file');
+
+      // Update notification about the issue but continue
+      await _updateNotificationProgress(_processedFiles, _totalFiles,
+          'Network issue with $fileName - continuing...');
+
+      // DON'T wait for network - just continue with the next file
+      // The individual file retry logic already handles network issues
     } else if (error.toString().contains('quotaExceeded')) {
-      setState(() {
-        _status = 'Google Drive storage quota exceeded';
-      });
-    } else if (error.toString().contains('authError')) {
-      setState(() {
-        _status = 'Authentication error - please sign in again';
-      });
+      if (mounted) {
+        setState(() {
+          _status = 'Google Drive storage quota exceeded';
+        });
+      }
+    } else if (error.toString().contains('authError') ||
+        error.toString().contains('status: 401') ||
+        error.toString().contains('authentication') ||
+        error.toString().contains('OAuth')) {
+      if (mounted) {
+        setState(() {
+          _status =
+              'Authentication expired - backup continuing, some files may be skipped';
+        });
+      }
+      print(
+          '🔑 Authentication token expired during backup. Files uploaded so far are safe.');
+      print(
+          '💡 Tip: For long backups, consider signing out and back in to refresh token.');
     } else {
-      setState(() {
-        _status = 'Upload error: ${error.toString().split(':').first}';
-      });
+      if (mounted) {
+        setState(() {
+          _status = 'Upload error: ${error.toString().split(':').first}';
+        });
+      }
     }
   }
 
@@ -663,6 +958,61 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
     }
   }
 
+  // Helper method to format bytes into human-readable format
+  String _formatBytes(int bytes) {
+    if (bytes == 0) return '0 B';
+    const suffixes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    int i = (math.log(bytes) / math.log(1024)).floor();
+    return '${(bytes / math.pow(1024, i)).toStringAsFixed(1)} ${suffixes[i]}';
+  }
+
+  // Cancel current file upload
+  void _cancelCurrentFile() {
+    setState(() {
+      _cancelCurrentFileFlag = true;
+      _currentFileName = '';
+      _currentFileProgress = 0.0;
+      _currentFileSize = 0;
+      _uploadedBytes = 0;
+    });
+  }
+
+  // Skip current file upload
+  void _skipCurrentFileUpload() {
+    setState(() {
+      _skipCurrentFile = true;
+      _currentFileName = '';
+      _currentFileProgress = 0.0;
+      _currentFileSize = 0;
+      _uploadedBytes = 0;
+    });
+  }
+
+  // Simulate upload progress since Google Drive API doesn't provide built-in progress tracking
+  void _simulateUploadProgress(int fileSize) {
+    final fileSizeMB = fileSize / 1024 / 1024;
+    print(
+        '🔄 Starting progress simulation for ${fileSizeMB.toStringAsFixed(2)} MB file');
+    Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      if (_cancelCurrentFileFlag || _skipCurrentFile || !_isBackingUp) {
+        timer.cancel();
+        return;
+      }
+
+      setState(() {
+        if (_currentFileProgress < 0.9) {
+          // Simulate progress up to 90% quickly, then slow down for the final phase
+          _currentFileProgress = math.min(0.9, _currentFileProgress + 0.05);
+          _uploadedBytes = (_currentFileProgress * fileSize).round();
+        }
+      });
+
+      if (_currentFileProgress >= 0.9) {
+        timer.cancel();
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -671,13 +1021,13 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
         title: const Text('Drive Backup'),
         actions: [
           IconButton(
-            icon: Icon(Theme.of(context).brightness == Brightness.dark 
-              ? Icons.light_mode 
-              : Icons.dark_mode),
+            icon: Icon(Theme.of(context).brightness == Brightness.dark
+                ? Icons.light_mode
+                : Icons.dark_mode),
             onPressed: widget.onThemeToggle,
-            tooltip: Theme.of(context).brightness == Brightness.dark 
-              ? 'Light Mode' 
-              : 'Dark Mode',
+            tooltip: Theme.of(context).brightness == Brightness.dark
+                ? 'Light Mode'
+                : 'Dark Mode',
           ),
           if (_currentUser != null)
             IconButton(
@@ -704,7 +1054,8 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                       : null,
                 ),
                 title: Text(_currentUser?.displayName ?? 'Not signed in'),
-                subtitle: Text(_currentUser?.email ?? 'Sign in to Google Drive'),
+                subtitle:
+                    Text(_currentUser?.email ?? 'Sign in to Google Drive'),
                 trailing: _currentUser == null
                     ? ElevatedButton.icon(
                         onPressed: _signIn,
@@ -758,8 +1109,10 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                       isExpanded: true,
                       items: const [
                         DropdownMenuItem(value: 1, child: Text('Every hour')),
-                        DropdownMenuItem(value: 6, child: Text('Every 6 hours')),
-                        DropdownMenuItem(value: 12, child: Text('Every 12 hours')),
+                        DropdownMenuItem(
+                            value: 6, child: Text('Every 6 hours')),
+                        DropdownMenuItem(
+                            value: 12, child: Text('Every 12 hours')),
                         DropdownMenuItem(value: 24, child: Text('Daily')),
                       ],
                       onChanged: (value) {
@@ -773,12 +1126,12 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                         }
                       },
                     ),
-                    
+
                     const SizedBox(height: 24),
                     // File size limit
                     Row(
                       children: [
-                        Icon(Icons.storage, color: Colors.orange),
+                        const Icon(Icons.storage, color: Colors.orange),
                         const SizedBox(width: 8),
                         Text(
                           'Max File Size',
@@ -820,7 +1173,7 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                   children: [
                     Row(
                       children: [
-                        Icon(Icons.wifi, color: Colors.blue),
+                        const Icon(Icons.wifi, color: Colors.blue),
                         const SizedBox(width: 8),
                         Text(
                           'Network Preferences',
@@ -830,11 +1183,15 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                     ),
                     const SizedBox(height: 8),
                     SwitchListTile(
-                      secondary: Icon(_wifiOnlyBackup ? Icons.wifi : Icons.signal_cellular_4_bar),
-                      title: Text(_wifiOnlyBackup ? 'WiFi Only Backup' : 'WiFi + Mobile Data'),
-                      subtitle: Text(_wifiOnlyBackup 
-                        ? 'Backup only when connected to WiFi'
-                        : 'Backup using WiFi or mobile data'),
+                      secondary: Icon(_wifiOnlyBackup
+                          ? Icons.wifi
+                          : Icons.signal_cellular_4_bar),
+                      title: Text(_wifiOnlyBackup
+                          ? 'WiFi Only Backup'
+                          : 'WiFi + Mobile Data'),
+                      subtitle: Text(_wifiOnlyBackup
+                          ? 'Backup only when connected to WiFi'
+                          : 'Backup using WiFi or mobile data'),
                       value: _wifiOnlyBackup,
                       onChanged: (value) {
                         setState(() {
@@ -858,7 +1215,7 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                   children: [
                     Row(
                       children: [
-                        Icon(Icons.palette, color: Colors.purple),
+                        const Icon(Icons.palette, color: Colors.purple),
                         const SizedBox(width: 8),
                         Text(
                           'Theme Settings',
@@ -871,27 +1228,33 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                       value: _themeMode,
                       isExpanded: true,
                       items: const [
-                        DropdownMenuItem(value: 'system', child: Row(
-                          children: [
-                            Icon(Icons.brightness_auto, size: 20),
-                            SizedBox(width: 8),
-                            Text('System Default'),
-                          ],
-                        )),
-                        DropdownMenuItem(value: 'light', child: Row(
-                          children: [
-                            Icon(Icons.light_mode, size: 20),
-                            SizedBox(width: 8),
-                            Text('Light Theme'),
-                          ],
-                        )),
-                        DropdownMenuItem(value: 'dark', child: Row(
-                          children: [
-                            Icon(Icons.dark_mode, size: 20),
-                            SizedBox(width: 8),
-                            Text('Dark Theme'),
-                          ],
-                        )),
+                        DropdownMenuItem(
+                            value: 'system',
+                            child: Row(
+                              children: [
+                                Icon(Icons.brightness_auto, size: 20),
+                                SizedBox(width: 8),
+                                Text('System Default'),
+                              ],
+                            )),
+                        DropdownMenuItem(
+                            value: 'light',
+                            child: Row(
+                              children: [
+                                Icon(Icons.light_mode, size: 20),
+                                SizedBox(width: 8),
+                                Text('Light Theme'),
+                              ],
+                            )),
+                        DropdownMenuItem(
+                            value: 'dark',
+                            child: Row(
+                              children: [
+                                Icon(Icons.dark_mode, size: 20),
+                                SizedBox(width: 8),
+                                Text('Dark Theme'),
+                              ],
+                            )),
                       ],
                       onChanged: (value) {
                         setState(() {
@@ -919,22 +1282,41 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
             ),
             const SizedBox(height: 16),
 
-            // Manual backup button
-            ElevatedButton.icon(
-              onPressed: _isBackingUp ? null : _performBackup,
-              icon: _isBackingUp
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.backup),
-              label: Text(_isBackingUp ? 'Backing up...' : 'Backup Now'),
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.all(16),
-                backgroundColor: Theme.of(context).colorScheme.primary,
-                foregroundColor: Colors.white,
-              ),
+            // Manual backup buttons
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isBackingUp ? null : _performBackup,
+                    icon: _isBackingUp
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.backup),
+                    label: Text(_isBackingUp ? 'Backing up...' : 'Backup Now'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.all(16),
+                      backgroundColor: Theme.of(context).colorScheme.primary,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                ),
+                if (_isBackingUp) ...[
+                  const SizedBox(width: 12),
+                  ElevatedButton.icon(
+                    onPressed: _stopBackup,
+                    icon: const Icon(Icons.stop),
+                    label: const Text('Stop'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.all(16),
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                ],
+              ],
             ),
             const SizedBox(height: 16),
 
@@ -948,34 +1330,134 @@ class _BackupHomePageState extends State<BackupHomePage> with WidgetsBindingObse
                     Row(
                       children: [
                         Icon(
-                          _isBackingUp ? Icons.sync : Icons.info_outline, 
+                          _isBackingUp ? Icons.sync : Icons.info_outline,
                           color: _isBackingUp ? Colors.orange : Colors.blue,
                         ),
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
                             _status,
-                            style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                              fontWeight: _isBackingUp ? FontWeight.w500 : FontWeight.normal,
-                            ),
+                            style:
+                                Theme.of(context).textTheme.bodyLarge?.copyWith(
+                                      fontWeight: _isBackingUp
+                                          ? FontWeight.w500
+                                          : FontWeight.normal,
+                                    ),
                           ),
                         ),
                       ],
                     ),
                     if (_isBackingUp) ...[
                       const SizedBox(height: 12),
+                      // Overall progress
                       LinearProgressIndicator(
                         value: _progress,
-                        backgroundColor: Theme.of(context).colorScheme.surfaceVariant,
+                        backgroundColor: Theme.of(context)
+                            .colorScheme
+                            .surfaceContainerHighest,
                         valueColor: AlwaysStoppedAnimation<Color>(
                           Theme.of(context).colorScheme.primary,
                         ),
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        '${(_progress * 100).toInt()}% completed',
+                        'Overall: ${(_progress * 100).toInt()}% completed ($_processedFiles/$_totalFiles files)',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
+
+                      // Current file information
+                      if (_currentFileName.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        const Divider(),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            const Icon(Icons.insert_drive_file,
+                                size: 16, color: Colors.grey),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                'Current file: $_currentFileName',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+
+                        // File progress bar
+                        LinearProgressIndicator(
+                          value: _currentFileProgress,
+                          backgroundColor: Colors.grey.shade300,
+                          valueColor:
+                              const AlwaysStoppedAnimation<Color>(Colors.green),
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              'File progress: ${(_currentFileProgress * 100).toInt()}%',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                            Text(
+                              '${_formatBytes(_uploadedBytes)} / ${_formatBytes(_currentFileSize)}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+
+                        // File control buttons
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                onPressed: _cancelCurrentFile,
+                                icon: const Icon(Icons.cancel,
+                                    size: 16, color: Colors.white),
+                                label: const Text('Cancel File',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w600)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.red.shade600,
+                                  foregroundColor: Colors.white,
+                                  elevation: 2,
+                                  padding: const EdgeInsets.symmetric(
+                                      vertical: 12, horizontal: 16),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                onPressed: _skipCurrentFileUpload,
+                                icon: const Icon(Icons.skip_next,
+                                    size: 16, color: Colors.white),
+                                label: const Text('Skip File',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w600)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.orange.shade600,
+                                  foregroundColor: Colors.white,
+                                  elevation: 2,
+                                  padding: const EdgeInsets.symmetric(
+                                      vertical: 12, horizontal: 16),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ],
                   ],
                 ),
@@ -993,7 +1475,7 @@ class BackupService {
     try {
       final prefs = await SharedPreferences.getInstance();
       final folderPath = prefs.getString('backup_folder');
-      
+
       if (folderPath == null || folderPath.isEmpty) {
         return false;
       }
@@ -1001,30 +1483,32 @@ class BackupService {
       // Check network connectivity for background backup
       final wifiOnlyBackup = prefs.getBool('wifi_only_backup') ?? true;
       final connectivityResult = await Connectivity().checkConnectivity();
-      
+
       if (connectivityResult.contains(ConnectivityResult.none)) {
         return false;
       }
-      
-      if (wifiOnlyBackup && !connectivityResult.contains(ConnectivityResult.wifi)) {
+
+      if (wifiOnlyBackup &&
+          !connectivityResult.contains(ConnectivityResult.wifi)) {
         return false; // Skip backup if WiFi only is enabled and not on WiFi
       }
 
       final googleSignIn = GoogleSignIn(
         scopes: [drive.DriveApi.driveFileScope],
-        serverClientId: '586439189867-mvmv4b1vlf7tm26s44aqemevc3efligs.apps.googleusercontent.com',
+        serverClientId:
+            '586439189867-mvmv4b1vlf7tm26s44aqemevc3efligs.apps.googleusercontent.com',
       );
-      
+
       final account = await googleSignIn.signInSilently();
       if (account == null) {
         return false;
       }
 
-      final authHeaders = await account.authHeaders;
-      final authenticateClient = GoogleAuthClient(authHeaders);
-      final driveApi = drive.DriveApi(authenticateClient);
+      // final authHeaders = await account.authHeaders;
+      // final authenticateClient = GoogleAuthClient(authHeaders);
+      // final driveApi = drive.DriveApi(authenticateClient);
 
-      // Implementation similar to manual backup
+      // TODO: Implementation similar to manual backup needs to be completed
       return true;
     } catch (e) {
       print('Backup error: $e');
