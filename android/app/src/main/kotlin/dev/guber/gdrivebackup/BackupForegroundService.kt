@@ -58,6 +58,9 @@ class BackupForegroundService : Service() {
     private var processedFiles = 0
     @Volatile private var userCancelled: Boolean = false
     private var currentStatus: String = "Initializing backup..."
+    // Track repeated auth failures (401) so we can abort early instead of spamming errors
+    private var globalInit401Count: Int = 0
+    @Volatile private var abortAuthInvalid: Boolean = false
 
     private fun scanCountFiles(dir: File, maxSizeBytes: Long): Int {
         var count = 0
@@ -100,7 +103,21 @@ class BackupForegroundService : Service() {
                     SessionLog.log("ERROR auth headers missing – aborting")
                     return@launch
                 }
-                val authHeaders = parseAuthHeaders(headersJson)
+                val authHeaders = parseAuthHeaders(headersJson).toMutableMap()
+
+                // Preflight token validity check (lightweight endpoint)
+                if (!validateAuthHeaders(authHeaders)) {
+                    SessionLog.log("AUTH_PREFLIGHT_401 initial token invalid – attempting one refresh")
+                    val refreshed = attemptAuthRefresh(authHeaders)
+                    if (!validateAuthHeaders(authHeaders)) {
+                        SessionLog.log("AUTH_ABORT preflight token invalid after refresh – aborting session")
+                        updateNotification("Auth invalid – aborting")
+                        BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to "Auth invalid (401)"))
+                        return@launch
+                    } else {
+                        SessionLog.log("AUTH_PREFLIGHT_RECOVER token valid after refresh")
+                    }
+                }
                 
                 val maxSizeBytes = maxSizeMB * 1024L * 1024L
                 totalFiles = scanCountFiles(root, maxSizeBytes)
@@ -172,6 +189,10 @@ class BackupForegroundService : Service() {
                 // Upload files preserving relative directory structure
                 root.walkTopDown().filter { it.isFile && it.length() <= maxSizeBytes }.forEach { file ->
                     if (!isRunning) return@launch
+                    if (abortAuthInvalid) {
+                        SessionLog.log("AUTH_ABORT skipping remaining files processed=$processedFiles/$totalFiles")
+                        return@forEach
+                    }
 
                     val fileName = file.name
                     // Determine relative directory ("" if file directly under root)
@@ -299,6 +320,7 @@ class BackupForegroundService : Service() {
                 SessionLog.log("SUMMARY processed=$processedFiles uploaded=$uploadedCount skippedHash=$skippedHashCount skippedSize=$skippedSizeCount errors=$errorCount bytes=$bytesUploaded durationMs=$durationMs userCancelled=$userCancelled")
                 val statusSuffix = when {
                     userCancelled -> "cancelled"
+                    abortAuthInvalid -> "auth"
                     errorCount > 0 -> "err$errorCount"
                     else -> "ok"
                 }
@@ -511,7 +533,7 @@ class BackupForegroundService : Service() {
         }
     }
     
-    private suspend fun uploadFileResumable(authHeaders: Map<String, String>, file: File, parentId: String): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun uploadFileResumable(authHeaders: MutableMap<String, String>, file: File, parentId: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val fileName = file.name
             val fileSize = file.length()
@@ -548,19 +570,41 @@ class BackupForegroundService : Service() {
                 "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
             }
             
-            val initConn = URL(uploadUrl).openConnection() as HttpURLConnection
-            authHeaders.entries.forEach { entry -> initConn.setRequestProperty(entry.key, entry.value) }
-            initConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            initConn.setRequestProperty("X-Upload-Content-Length", fileSize.toString())
-            initConn.requestMethod = if (existingFileId != null) "PATCH" else "POST"
-            initConn.doOutput = true
-            initConn.outputStream.write(metadata.toString().toByteArray())
-
-            val initCode = initConn.responseCode
-            if (initCode !in 200..299) {
-                val errBody = try { initConn.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
-                SessionLog.log("ERROR upload_init_failed file=$fileName code=$initCode body=${errBody ?: "(none)"}")
-                android.util.Log.e("BackupService", "Failed to initiate upload for $fileName code=$initCode body=${errBody ?: "(none)"}")
+            // Initiate resumable upload with auth refresh fallback if first attempt is 401
+            var initAttempt = 0
+            var initConn: HttpURLConnection
+            var initCode: Int
+            var initErrBody: String? = null
+            while (true) {
+                initConn = URL(uploadUrl).openConnection() as HttpURLConnection
+                authHeaders.entries.forEach { entry -> initConn.setRequestProperty(entry.key, entry.value) }
+                initConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                initConn.setRequestProperty("X-Upload-Content-Length", fileSize.toString())
+                initConn.requestMethod = if (existingFileId != null) "PATCH" else "POST"
+                initConn.doOutput = true
+                initConn.outputStream.write(metadata.toString().toByteArray())
+                initCode = initConn.responseCode
+                if (initCode == 401 && initAttempt == 0) {
+                    globalInit401Count++
+                    SessionLog.log("AUTH_UPLOAD_INIT_401 file=$fileName attempt=1 – trying refresh")
+                    attemptAuthRefresh(authHeaders)
+                    initAttempt++
+                    continue
+                }
+                break
+            }
+            if (initCode == 401) {
+                initErrBody = try { initConn.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
+                SessionLog.log("ERROR upload_init_failed file=$fileName code=$initCode body=${initErrBody ?: "(none)"}")
+                if (globalInit401Count >= 5) {
+                    abortAuthInvalid = true
+                    SessionLog.log("AUTH_ABORT consecutive_init_401 threshold reached count=$globalInit401Count")
+                }
+                return@withContext false
+            } else if (initCode !in 200..299) {
+                initErrBody = try { initConn.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
+                SessionLog.log("ERROR upload_init_failed file=$fileName code=$initCode body=${initErrBody ?: "(none)"}")
+                android.util.Log.e("BackupService", "Failed to initiate upload for $fileName code=$initCode body=${initErrBody ?: "(none)"}")
                 return@withContext false
             } else {
                 SessionLog.log("UPLOAD_INIT file=$fileName code=$initCode mode=${if (existingFileId!=null) "PATCH" else "POST"}")
@@ -699,6 +743,37 @@ class BackupForegroundService : Service() {
         } catch (e: Exception) {
             android.util.Log.e("BackupService", "Error uploading file: $e")
             SessionLog.log("ERROR uploading file=${file.name} ex=${e.javaClass.simpleName} msg=${e.message}")
+            false
+        }
+    }
+
+    // Lightweight validation using Drive about endpoint
+    private fun validateAuthHeaders(authHeaders: Map<String, String>): Boolean {
+        return try {
+            val conn = URL("https://www.googleapis.com/drive/v3/about?fields=user").openConnection() as HttpURLConnection
+            authHeaders.entries.forEach { conn.setRequestProperty(it.key, it.value) }
+            conn.requestMethod = "GET"
+            val code = conn.responseCode
+            code != 401
+        } catch (e: Exception) { false }
+    }
+
+    // Attempt to refresh auth headers by asking Flutter side (stored in prefs). This is a placeholder relying on updated SharedPreferences
+    private fun attemptAuthRefresh(authHeaders: MutableMap<String, String>): Boolean {
+        return try {
+            val prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+            val headersJson = prefs.getString("auth_headers_json", null)
+            if (headersJson != null) {
+                val newMap = parseAuthHeaders(headersJson)
+                newMap.forEach { (k,v) -> authHeaders[k] = v }
+                SessionLog.log("AUTH_REFRESH success keys=${newMap.keys.joinToString(",")}")
+                true
+            } else {
+                SessionLog.log("AUTH_REFRESH missing headersJson")
+                false
+            }
+        } catch (e: Exception) {
+            SessionLog.log("AUTH_REFRESH_EXCEPTION ex=${e.javaClass.simpleName} msg=${e.message}")
             false
         }
     }
