@@ -25,11 +25,22 @@ android {
         versionCode = 1
         versionName = "1.0"
         multiDexEnabled = true
+        // Limit ABIs to arm64-v8a to avoid Windows file locking issues when cleaning other architectures
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // Ensure old native lib folders are not merged for excluded ABIs
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 }

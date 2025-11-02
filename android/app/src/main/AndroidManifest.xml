@@ -34,6 +34,10 @@
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true"
         android:allowBackup="false">
+        <service
+            android:name=".BackupForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         
         <activity
             android:name=".MainActivity"

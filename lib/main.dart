@@ -12,6 +12,7 @@ import 'dart:math' as math;
 import 'package:path/path.dart' as path;
 import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:uuid/uuid.dart';
 
 // Background task callback
 @pragma('vm:entry-point')
@@ -177,15 +178,41 @@ class _BackupHomePageState extends State<BackupHomePage>
   double _currentFileProgress = 0.0;
   int _currentFileSize = 0;
   int _uploadedBytes = 0;
+  int _skippedFiles = 0; // count of skipped files (native mode)
   bool _cancelCurrentFileFlag = false;
+
+  // Native summary metrics (emitted by foreground service)
+  int _summaryUploadedCount = 0;
+  int _summarySkippedHashCount = 0;
+  int _summarySkippedSizeCount = 0;
+  int _summaryErrorCount = 0;
+  int _summaryBytesUploaded = 0;
+  int _summaryDurationMs = 0;
+  DateTime? _summaryTimestamp; // when summary was recorded
+
+  // Reverify flag (forces remote listing & ignores cache on native backup)
+  bool _forceReverify = false;
 
   // Network monitoring
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+  StreamSubscription<dynamic>? _nativeEventSubscription;
 
   // Heartbeat and monitoring
   DateTime? _lastProgressUpdate;
   bool _syncStoppedManually = false;
   bool _skipCurrentFile = false;
+  Timer? _serviceWatchdog;
+  static const _serviceHeartbeatTimeout =
+      Duration(minutes: 2); // if no heartbeat for 2 minutes => attempt recovery
+
+  // Native backup mode
+  bool _useNativeBackup = false;
+
+  // Device identity (stable per install) for multi-device separation
+  String? _deviceId; // full UUID
+  String get _deviceShortId => _deviceId != null && _deviceId!.length >= 8
+      ? _deviceId!.substring(0, 8)
+      : 'unknown';
 
   // Settings
   bool _wifiOnlyBackup = true; // Default to WiFi only for data saving
@@ -196,7 +223,8 @@ class _BackupHomePageState extends State<BackupHomePage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadSettings();
-
+    _ensureDeviceIdentity();
+    _loadSummaryMetrics();
     // Check if backup was running when app was closed
     _restoreBackupState();
 
@@ -204,14 +232,21 @@ class _BackupHomePageState extends State<BackupHomePage>
     _checkBackgroundPermissions();
 
     _googleSignIn.onCurrentUserChanged.listen((account) {
+      print('Current user changed: $account');
       setState(() {
         _currentUser = account;
         if (account != null) {
           _status = 'Signed in as ${account.email}';
+        } else {
+          _status = 'Not signed in';
         }
       });
     });
-    _googleSignIn.signInSilently();
+    _googleSignIn.signInSilently().then((account) {
+      print('Silent sign-in result: $account');
+    }).catchError((error) {
+      print('Silent sign-in error: $error');
+    });
 
     // Monitor network connectivity changes
     _connectivitySubscription =
@@ -221,12 +256,135 @@ class _BackupHomePageState extends State<BackupHomePage>
         // The backup process will check network availability on each file
       }
     });
+
+    // Subscribe to native backup events
+    _subscribeToNativeEvents();
+  }
+
+  void _subscribeToNativeEvents() {
+    const eventChannel = EventChannel('dev.guber.gdrivebackup/events');
+    _nativeEventSubscription =
+        eventChannel.receiveBroadcastStream().listen((event) {
+      if (event is Map) {
+        final type = event['type'] as String?;
+        // Debug instrumentation for native events
+        // ignore: avoid_print
+        print('[NativeEvent] $type -> $event');
+        switch (type) {
+          case 'scan_complete':
+            if (mounted) {
+              setState(() {
+                _totalFiles = event['total'] as int? ?? 0;
+                _processedFiles = event['processed'] as int? ?? 0;
+                _progress =
+                    _totalFiles > 0 ? _processedFiles / _totalFiles : 0.0;
+                _status = 'Scan complete: $_totalFiles files';
+              });
+            }
+            break;
+          case 'native_progress':
+            if (mounted) {
+              setState(() {
+                _processedFiles = event['processed'] as int? ?? 0;
+                _totalFiles = event['total'] as int? ?? _totalFiles;
+                _progress =
+                    _totalFiles > 0 ? _processedFiles / _totalFiles : 0.0;
+                _status = event['status'] as String? ?? 'Backing up...';
+              });
+            }
+            break;
+          case 'file_start':
+            if (mounted) {
+              setState(() {
+                _currentFileName = event['fileName'] as String? ?? '';
+                _currentFileSize = event['fileSize'] as int? ?? 0;
+                _currentFileProgress = 0.0;
+                _uploadedBytes = 0;
+              });
+            }
+            break;
+          case 'file_progress':
+            if (mounted) {
+              setState(() {
+                _currentFileProgress =
+                    (event['progress'] as num?)?.toDouble() ?? 0.0;
+                _uploadedBytes = event['uploaded'] as int? ?? 0;
+              });
+            }
+            break;
+          case 'file_done':
+            if (mounted) {
+              setState(() {
+                _currentFileProgress = 1.0;
+                _uploadedBytes = _currentFileSize;
+              });
+            }
+            break;
+          case 'file_skipped':
+            if (mounted) {
+              setState(() {
+                _skippedFiles += 1;
+                // Rely on subsequent native_progress event for processed count to avoid double increment.
+                _status =
+                    'Skipped ${event['fileName']} ($_processedFiles/$_totalFiles)';
+              });
+            }
+            break;
+          case 'native_summary':
+            // Final metrics summary from native service
+            if (mounted) {
+              setState(() {
+                _summaryUploadedCount = event['uploadedCount'] as int? ?? 0;
+                _summarySkippedHashCount =
+                    event['skippedHashCount'] as int? ?? 0;
+                _summarySkippedSizeCount =
+                    event['skippedSizeCount'] as int? ?? 0;
+                _summaryErrorCount = event['errorCount'] as int? ?? 0;
+                _summaryBytesUploaded = event['bytesUploaded'] as int? ?? 0;
+                _summaryDurationMs = event['durationMs'] as int? ?? 0;
+                _summaryTimestamp = DateTime.now();
+              });
+            }
+            _saveSummaryMetrics();
+            break;
+          case 'native_complete':
+            if (mounted) {
+              setState(() {
+                _isBackingUp = false;
+                _processedFiles = event['processed'] as int? ?? 0;
+                _status = event['status'] as String? ?? 'Backup complete';
+                _progress = 1.0;
+                _currentFileName = '';
+                _currentFileProgress = 0.0;
+              });
+              _clearBackupState();
+              _setWakeLock(false);
+              _stopServiceWatchdog();
+            }
+            break;
+          case 'error':
+            if (mounted) {
+              setState(() {
+                _status = 'Error: ${event['message'] ?? 'Unknown error'}';
+                _isBackingUp = false;
+              });
+              _clearBackupState();
+              _setWakeLock(false);
+              _stopServiceWatchdog();
+            }
+            break;
+        }
+      }
+    }, onError: (error) {
+      print('Native event stream error: $error');
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySubscription?.cancel();
+    _nativeEventSubscription?.cancel();
     super.dispose();
   }
 
@@ -318,6 +476,9 @@ class _BackupHomePageState extends State<BackupHomePage>
       _maxFileSizeMB = prefs.getInt('max_file_size_mb') ?? 200;
       _wifiOnlyBackup = prefs.getBool('wifi_only_backup') ?? true;
       _themeMode = prefs.getString('theme_mode') ?? 'system';
+      _useNativeBackup = prefs.getBool('use_native_backup') ?? false;
+      _forceReverify = prefs.getBool('force_reverify') ?? false;
+      _deviceId = prefs.getString('device_id');
     });
   }
 
@@ -331,6 +492,59 @@ class _BackupHomePageState extends State<BackupHomePage>
     await prefs.setInt('max_file_size_mb', _maxFileSizeMB);
     await prefs.setBool('wifi_only_backup', _wifiOnlyBackup);
     await prefs.setString('theme_mode', _themeMode);
+    await prefs.setBool('use_native_backup', _useNativeBackup);
+    await prefs.setBool('force_reverify', _forceReverify);
+    if (_deviceId != null) {
+      await prefs.setString('device_id', _deviceId!);
+    }
+  }
+
+  // Ensure a stable per-install UUID for device identity; no PII, just random
+  Future<void> _ensureDeviceIdentity() async {
+    if (_deviceId != null) return;
+    final prefs = await SharedPreferences.getInstance();
+    var existing = prefs.getString('device_id');
+    if (existing == null) {
+      // Generate new UUID v4
+      final newId = const Uuid().v4();
+      await prefs.setString('device_id', newId);
+      existing = newId;
+      print('🔐 Generated new device identity: $existing');
+    } else {
+      print('🔐 Loaded existing device identity: $existing');
+    }
+    setState(() {
+      _deviceId = existing;
+    });
+  }
+
+  // Persist summary metrics after native backup completes
+  Future<void> _saveSummaryMetrics() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('summary_uploaded', _summaryUploadedCount);
+    await prefs.setInt('summary_skipped_hash', _summarySkippedHashCount);
+    await prefs.setInt('summary_skipped_size', _summarySkippedSizeCount);
+    await prefs.setInt('summary_errors', _summaryErrorCount);
+    await prefs.setInt('summary_bytes', _summaryBytesUploaded);
+    await prefs.setInt('summary_duration_ms', _summaryDurationMs);
+    await prefs.setInt(
+        'summary_timestamp', _summaryTimestamp?.millisecondsSinceEpoch ?? 0);
+  }
+
+  // Load persisted summary metrics on app start
+  Future<void> _loadSummaryMetrics() async {
+    final prefs = await SharedPreferences.getInstance();
+    final tsMs = prefs.getInt('summary_timestamp') ?? 0;
+    if (tsMs == 0) return; // No summary yet
+    setState(() {
+      _summaryUploadedCount = prefs.getInt('summary_uploaded') ?? 0;
+      _summarySkippedHashCount = prefs.getInt('summary_skipped_hash') ?? 0;
+      _summarySkippedSizeCount = prefs.getInt('summary_skipped_size') ?? 0;
+      _summaryErrorCount = prefs.getInt('summary_errors') ?? 0;
+      _summaryBytesUploaded = prefs.getInt('summary_bytes') ?? 0;
+      _summaryDurationMs = prefs.getInt('summary_duration_ms') ?? 0;
+      _summaryTimestamp = DateTime.fromMillisecondsSinceEpoch(tsMs);
+    });
   }
 
   // Wake lock functionality for background processing during backup
@@ -416,9 +630,13 @@ class _BackupHomePageState extends State<BackupHomePage>
     }
   }
 
-  // Update notification with progress (keeps user informed)
+  // Update notification for Dart-driven backup only; skip if native service active
   Future<void> _updateNotificationProgress(int current, int total,
       [String? currentFile]) async {
+    if (_useNativeBackup) {
+      // Native service handles its own notification; avoid duplicates
+      return;
+    }
     try {
       const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
       final statusText = currentFile != null
@@ -428,9 +646,8 @@ class _BackupHomePageState extends State<BackupHomePage>
       await platform.invokeMethod('updateProgress',
           {'current': current, 'total': total, 'status': statusText});
 
-      // Also update UI notification periodically
-      if (mounted && current % 5 == 0) {
-        // Update every 5 files
+      // Periodic UI status update
+      if (mounted) {
         setState(() {
           _status = statusText;
         });
@@ -579,10 +796,69 @@ class _BackupHomePageState extends State<BackupHomePage>
     }
   }
 
+  void _startServiceWatchdog() {
+    _serviceWatchdog?.cancel();
+    _serviceWatchdog = Timer.periodic(const Duration(seconds: 45), (_) async {
+      if (!_isBackingUp || _syncStoppedManually) return;
+      try {
+        const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+        final running =
+            await platform.invokeMethod<bool>('isBackupServiceRunning') ??
+                false;
+        final heartbeatTs =
+            await platform.invokeMethod<int>('getBackupServiceHeartbeat') ?? 0;
+        final userStopped =
+            await platform.invokeMethod<bool>('wasUserStopped') ?? false;
+        final last =
+            DateTime.fromMillisecondsSinceEpoch(heartbeatTs, isUtc: false);
+        final now = DateTime.now();
+        final diff = now.difference(last);
+        if (!userStopped &&
+            (!running || heartbeatTs == 0 || diff > _serviceHeartbeatTimeout)) {
+          // Attempt recovery: restart service
+          print(
+              '🛠️ Watchdog restarting foreground service (running=$running, last=$diff ago)');
+          await platform.invokeMethod('startBackupService');
+          // Force update notification with current status
+          await platform.invokeMethod('updateServiceProgress', {
+            'current': _processedFiles,
+            'total': _totalFiles,
+            'status': _status,
+          });
+        }
+      } catch (e) {
+        print('Watchdog error: $e');
+      }
+    });
+  }
+
+  void _stopServiceWatchdog() {
+    _serviceWatchdog?.cancel();
+    _serviceWatchdog = null;
+  }
+
   Future<void> _signIn() async {
     try {
-      await _googleSignIn.signIn();
+      print('Starting Google Sign-In...');
+      final result = await _googleSignIn.signIn();
+      print('Sign-In result: $result');
+      if (result == null) {
+        print('Sign-In was cancelled or failed');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Sign in was cancelled')),
+          );
+        }
+      } else {
+        print('Sign-In successful: ${result.email}');
+        setState(() {
+          _currentUser = result;
+          _status = 'Signed in as ${result.email}';
+        });
+      }
     } catch (error) {
+      print('Sign-In error: $error');
+      print('Error type: ${error.runtimeType}');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Sign in failed: $error')),
@@ -760,6 +1036,15 @@ class _BackupHomePageState extends State<BackupHomePage>
     // Enable background processing during backup
     await _setWakeLock(true);
 
+    // Start Android foreground service (ensures process kept alive)
+    try {
+      const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+      await platform.invokeMethod('setUserStopped', {'stopped': false});
+      await platform.invokeMethod('startBackupService');
+    } catch (e) {
+      print('Failed to start foreground service: $e');
+    }
+
     // Show notification that backup is running
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -771,6 +1056,38 @@ class _BackupHomePageState extends State<BackupHomePage>
 
     // Start heartbeat monitoring
     _startHeartbeatMonitoring();
+    _startServiceWatchdog();
+
+    // Check if native backup mode is enabled (can add setting later)
+    // For now, use native mode if available (prefer service-based upload)
+    if (_useNativeBackup) {
+      try {
+        // Pass auth headers to native
+        final authHeaders = await _currentUser!.authHeaders;
+        const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+        await platform.invokeMethod('setAuthHeaders', {'headers': authHeaders});
+
+        // Start native backup
+        await platform.invokeMethod('startNativeBackup', {
+          'root': _selectedFolderPath!,
+          'maxMb': _maxFileSizeMB,
+          'reverify': _forceReverify,
+          'deviceId': _deviceShortId,
+        });
+
+        // Native events will update UI
+        print('Native backup started');
+      } catch (e) {
+        setState(() {
+          _status = 'Error starting native backup: $e';
+          _isBackingUp = false;
+        });
+        _clearBackupState();
+        await _setWakeLock(false);
+        _stopServiceWatchdog();
+      }
+      return; // Exit early - native mode handles everything
+    }
 
     try {
       final folder = Directory(_selectedFolderPath!);
@@ -792,8 +1109,9 @@ class _BackupHomePageState extends State<BackupHomePage>
       final driveApi = drive.DriveApi(authenticateClient);
 
       // Get or create backup folder
+      final deviceRootName = 'AppBackup_${_deviceShortId}';
       final appBackupFolderId =
-          await _getOrCreateDriveFolder(driveApi, 'AppBackup');
+          await _getOrCreateDriveFolder(driveApi, deviceRootName);
 
       // Create subfolder with the name of the selected folder
       final selectedFolderName = path.basename(_selectedFolderPath!);
@@ -837,6 +1155,16 @@ class _BackupHomePageState extends State<BackupHomePage>
 
       // Release wake lock when backup is done
       await _setWakeLock(false);
+
+      _stopServiceWatchdog();
+
+      // Stop foreground service
+      try {
+        const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+        await platform.invokeMethod('stopBackupService');
+      } catch (e) {
+        print('Failed to stop foreground service: $e');
+      }
     }
   }
 
@@ -861,6 +1189,17 @@ class _BackupHomePageState extends State<BackupHomePage>
 
     // Release wake lock immediately
     _setWakeLock(false);
+
+    _stopServiceWatchdog();
+
+    // Stop foreground service
+    try {
+      const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+      platform.invokeMethod('setUserStopped', {'stopped': true});
+      platform.invokeMethod('stopBackupService');
+    } catch (e) {
+      print('Failed to stop foreground service: $e');
+    }
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -1072,7 +1411,38 @@ class _BackupHomePageState extends State<BackupHomePage>
           ..name = fileName
           ..parents = [parentId];
 
-        final media = drive.Media(file.openRead(), fileSize);
+        // Wrap stream to report real progress
+        final originalStream = file.openRead();
+        final reportingStream =
+            originalStream.transform<List<int>>(StreamTransformer.fromHandlers(
+          handleData: (data, sink) {
+            if (_cancelCurrentFileFlag || _skipCurrentFile || !_isBackingUp) {
+              // If cancelled/skip, do not forward further data
+              return;
+            }
+            _uploadedBytes += data.length;
+            final progress =
+                _currentFileSize > 0 ? _uploadedBytes / _currentFileSize : 0.0;
+            // Throttle setState to avoid jank
+            if (progress - _currentFileProgress >= 0.01 || progress == 1.0) {
+              if (mounted) {
+                setState(() {
+                  _currentFileProgress =
+                      progress.clamp(0.0, 0.99); // keep <1.0 until completion
+                });
+              }
+            }
+            sink.add(data);
+          },
+          handleError: (error, stackTrace, sink) {
+            sink.addError(error, stackTrace);
+          },
+          handleDone: (sink) {
+            sink.close();
+          },
+        ));
+
+        final media = drive.Media(reportingStream, fileSize);
 
         if (fileList.files != null && fileList.files!.isNotEmpty) {
           // Update existing file
@@ -1083,7 +1453,7 @@ class _BackupHomePageState extends State<BackupHomePage>
           // Only update if local file is newer
           if (driveModified == null || localModified.isAfter(driveModified)) {
             // Start progress tracking
-            _simulateUploadProgress(fileSize);
+            // real progress already tracked by reportingStream
 
             // Add timeout to prevent hanging
             await Future.any([
@@ -1099,7 +1469,7 @@ class _BackupHomePageState extends State<BackupHomePage>
           }
         } else {
           // Start progress tracking
-          _simulateUploadProgress(fileSize);
+          // real progress already tracked by reportingStream
 
           // Create new file with timeout
           await Future.any([
@@ -1276,33 +1646,12 @@ class _BackupHomePageState extends State<BackupHomePage>
     });
   }
 
-  // Simulate upload progress since Google Drive API doesn't provide built-in progress tracking
-  void _simulateUploadProgress(int fileSize) {
-    final fileSizeMB = fileSize / 1024 / 1024;
-    print(
-        '🔄 Starting progress simulation for ${fileSizeMB.toStringAsFixed(2)} MB file');
-    Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      if (_cancelCurrentFileFlag || _skipCurrentFile || !_isBackingUp) {
-        timer.cancel();
-        return;
-      }
-
-      setState(() {
-        if (_currentFileProgress < 0.9) {
-          // Simulate progress up to 90% quickly, then slow down for the final phase
-          _currentFileProgress = math.min(0.9, _currentFileProgress + 0.05);
-          _uploadedBytes = (_currentFileProgress * fileSize).round();
-        }
-      });
-
-      if (_currentFileProgress >= 0.9) {
-        timer.cancel();
-      }
-    });
-  }
+  // (Removed) Simulated upload progress now replaced by real stream-based progress tracking
 
   @override
   Widget build(BuildContext context) {
+    // Wrap Scaffold body with SafeArea and ensure bottom inset padding so content
+    // (status/progress cards) is not covered by system navigation bar.
     return Scaffold(
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
@@ -1325,363 +1674,385 @@ class _BackupHomePageState extends State<BackupHomePage>
             ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Sign in status
-            Card(
-              child: ListTile(
-                leading: CircleAvatar(
-                  backgroundImage: _currentUser?.photoUrl != null
-                      ? NetworkImage(_currentUser!.photoUrl!)
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Sign in status
+              Card(
+                child: ListTile(
+                  leading: CircleAvatar(
+                    backgroundImage: _currentUser?.photoUrl != null
+                        ? NetworkImage(_currentUser!.photoUrl!)
+                        : null,
+                    child: _currentUser?.photoUrl == null
+                        ? const Icon(Icons.account_circle)
+                        : null,
+                  ),
+                  title: Text(_currentUser?.displayName ?? 'Not signed in'),
+                  subtitle:
+                      Text(_currentUser?.email ?? 'Sign in to Google Drive'),
+                  trailing: _currentUser == null
+                      ? ElevatedButton.icon(
+                          onPressed: _signIn,
+                          icon: const Icon(Icons.login),
+                          label: const Text('Sign In'),
+                        )
                       : null,
-                  child: _currentUser?.photoUrl == null
-                      ? const Icon(Icons.account_circle)
-                      : null,
-                ),
-                title: Text(_currentUser?.displayName ?? 'Not signed in'),
-                subtitle:
-                    Text(_currentUser?.email ?? 'Sign in to Google Drive'),
-                trailing: _currentUser == null
-                    ? ElevatedButton.icon(
-                        onPressed: _signIn,
-                        icon: const Icon(Icons.login),
-                        label: const Text('Sign In'),
-                      )
-                    : null,
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Folder selection
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.folder_open, color: Colors.orange),
-                title: const Text('Backup Folder'),
-                subtitle: Text(
-                  _selectedFolderPath ?? 'No folder selected',
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                trailing: IconButton(
-                  icon: const Icon(Icons.edit),
-                  onPressed: _selectFolder,
-                  tooltip: 'Select Folder',
                 ),
               ),
-            ),
-            const SizedBox(height: 16),
+              const SizedBox(height: 16),
 
-            // Backup interval
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.schedule, color: Colors.blue),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Backup Interval',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    DropdownButton<int>(
-                      value: _backupInterval,
-                      isExpanded: true,
-                      items: const [
-                        DropdownMenuItem(value: 1, child: Text('Every hour')),
-                        DropdownMenuItem(
-                            value: 6, child: Text('Every 6 hours')),
-                        DropdownMenuItem(
-                            value: 12, child: Text('Every 12 hours')),
-                        DropdownMenuItem(value: 24, child: Text('Daily')),
-                      ],
-                      onChanged: (value) {
-                        setState(() {
-                          _backupInterval = value!;
-                        });
-                        _saveSettings();
-                        if (_isBackupEnabled) {
-                          _togglePeriodicBackup(false);
-                          _togglePeriodicBackup(true);
-                        }
-                      },
-                    ),
-
-                    const SizedBox(height: 24),
-                    // File size limit
-                    Row(
-                      children: [
-                        const Icon(Icons.storage, color: Colors.orange),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Max File Size',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    DropdownButton<int>(
-                      value: _maxFileSizeMB,
-                      isExpanded: true,
-                      items: const [
-                        DropdownMenuItem(value: 10, child: Text('10 MB')),
-                        DropdownMenuItem(value: 50, child: Text('50 MB')),
-                        DropdownMenuItem(value: 100, child: Text('100 MB')),
-                        DropdownMenuItem(value: 200, child: Text('200 MB')),
-                        DropdownMenuItem(value: 500, child: Text('500 MB')),
-                        DropdownMenuItem(value: 1000, child: Text('1 GB')),
-                      ],
-                      onChanged: (value) {
-                        setState(() {
-                          _maxFileSizeMB = value!;
-                        });
-                        _saveSettings();
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Network preferences
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.wifi, color: Colors.blue),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Network Preferences',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    SwitchListTile(
-                      secondary: Icon(_wifiOnlyBackup
-                          ? Icons.wifi
-                          : Icons.signal_cellular_4_bar),
-                      title: Text(_wifiOnlyBackup
-                          ? 'WiFi Only Backup'
-                          : 'WiFi + Mobile Data'),
-                      subtitle: Text(_wifiOnlyBackup
-                          ? 'Backup only when connected to WiFi'
-                          : 'Backup using WiFi or mobile data'),
-                      value: _wifiOnlyBackup,
-                      onChanged: (value) {
-                        setState(() {
-                          _wifiOnlyBackup = value;
-                        });
-                        _saveSettings();
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Theme preferences
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.palette, color: Colors.purple),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Theme Settings',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    DropdownButton<String>(
-                      value: _themeMode,
-                      isExpanded: true,
-                      items: const [
-                        DropdownMenuItem(
-                            value: 'system',
-                            child: Row(
-                              children: [
-                                Icon(Icons.brightness_auto, size: 20),
-                                SizedBox(width: 8),
-                                Text('System Default'),
-                              ],
-                            )),
-                        DropdownMenuItem(
-                            value: 'light',
-                            child: Row(
-                              children: [
-                                Icon(Icons.light_mode, size: 20),
-                                SizedBox(width: 8),
-                                Text('Light Theme'),
-                              ],
-                            )),
-                        DropdownMenuItem(
-                            value: 'dark',
-                            child: Row(
-                              children: [
-                                Icon(Icons.dark_mode, size: 20),
-                                SizedBox(width: 8),
-                                Text('Dark Theme'),
-                              ],
-                            )),
-                      ],
-                      onChanged: (value) {
-                        setState(() {
-                          _themeMode = value!;
-                        });
-                        _saveSettings();
-                        _applyThemeMode(value!);
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Enable periodic backup
-            Card(
-              child: SwitchListTile(
-                secondary: const Icon(Icons.sync, color: Colors.green),
-                title: const Text('Enable Periodic Backup'),
-                subtitle: const Text('Automatically backup in background'),
-                value: _isBackupEnabled,
-                onChanged: _togglePeriodicBackup,
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Manual backup buttons
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _isBackingUp ? null : _performBackup,
-                    icon: _isBackingUp
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.backup),
-                    label: Text(_isBackingUp ? 'Backing up...' : 'Backup Now'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.all(16),
-                      backgroundColor: Theme.of(context).colorScheme.primary,
-                      foregroundColor: Colors.white,
-                    ),
+              // Folder selection
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.folder_open, color: Colors.orange),
+                  title: const Text('Backup Folder'),
+                  subtitle: Text(
+                    _selectedFolderPath ?? 'No folder selected',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.edit),
+                    onPressed: _selectFolder,
+                    tooltip: 'Select Folder',
                   ),
                 ),
-                if (_isBackingUp) ...[
-                  const SizedBox(width: 12),
-                  ElevatedButton.icon(
-                    onPressed: _stopBackup,
-                    icon: const Icon(Icons.stop),
-                    label: const Text('Stop'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.all(16),
-                      backgroundColor: Colors.red,
-                      foregroundColor: Colors.white,
+              ),
+              const SizedBox(height: 16),
+
+              // Backup interval
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.schedule, color: Colors.blue),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Backup Interval',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButton<int>(
+                        value: _backupInterval,
+                        isExpanded: true,
+                        items: const [
+                          DropdownMenuItem(value: 1, child: Text('Every hour')),
+                          DropdownMenuItem(
+                              value: 6, child: Text('Every 6 hours')),
+                          DropdownMenuItem(
+                              value: 12, child: Text('Every 12 hours')),
+                          DropdownMenuItem(value: 24, child: Text('Daily')),
+                        ],
+                        onChanged: (value) {
+                          setState(() {
+                            _backupInterval = value!;
+                          });
+                          _saveSettings();
+                          if (_isBackupEnabled) {
+                            _togglePeriodicBackup(false);
+                            _togglePeriodicBackup(true);
+                          }
+                        },
+                      ),
+
+                      const SizedBox(height: 24),
+                      // File size limit
+                      Row(
+                        children: [
+                          const Icon(Icons.storage, color: Colors.orange),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Max File Size',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButton<int>(
+                        value: _maxFileSizeMB,
+                        isExpanded: true,
+                        items: const [
+                          DropdownMenuItem(value: 10, child: Text('10 MB')),
+                          DropdownMenuItem(value: 50, child: Text('50 MB')),
+                          DropdownMenuItem(value: 100, child: Text('100 MB')),
+                          DropdownMenuItem(value: 200, child: Text('200 MB')),
+                          DropdownMenuItem(value: 500, child: Text('500 MB')),
+                          DropdownMenuItem(value: 1000, child: Text('1 GB')),
+                        ],
+                        onChanged: (value) {
+                          setState(() {
+                            _maxFileSizeMB = value!;
+                          });
+                          _saveSettings();
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Network preferences
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.wifi, color: Colors.blue),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Network Preferences',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        secondary: Icon(_wifiOnlyBackup
+                            ? Icons.wifi
+                            : Icons.signal_cellular_4_bar),
+                        title: Text(_wifiOnlyBackup
+                            ? 'WiFi Only Backup'
+                            : 'WiFi + Mobile Data'),
+                        subtitle: Text(_wifiOnlyBackup
+                            ? 'Backup only when connected to WiFi'
+                            : 'Backup using WiFi or mobile data'),
+                        value: _wifiOnlyBackup,
+                        onChanged: (value) {
+                          setState(() {
+                            _wifiOnlyBackup = value;
+                          });
+                          _saveSettings();
+                        },
+                      ),
+                      const Divider(height: 24),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.cloud_upload),
+                        title: const Text('Native Service Upload'),
+                        subtitle: const Text(
+                            'Use service-based upload for better reliability'),
+                        value: _useNativeBackup,
+                        onChanged: (value) {
+                          setState(() {
+                            _useNativeBackup = value;
+                          });
+                          _saveSettings();
+                        },
+                      ),
+                      if (_useNativeBackup)
+                        SwitchListTile(
+                          secondary: const Icon(Icons.verified),
+                          title: const Text('Force Reverify (ignore cache)'),
+                          subtitle: const Text(
+                              'Bypass metadata cache and re-scan remote Drive'),
+                          value: _forceReverify,
+                          onChanged: (value) {
+                            setState(() {
+                              _forceReverify = value;
+                            });
+                            _saveSettings();
+                          },
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Theme preferences
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.palette, color: Colors.purple),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Theme Settings',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButton<String>(
+                        value: _themeMode,
+                        isExpanded: true,
+                        items: const [
+                          DropdownMenuItem(
+                              value: 'system',
+                              child: Row(
+                                children: [
+                                  Icon(Icons.brightness_auto, size: 20),
+                                  SizedBox(width: 8),
+                                  Text('System Default'),
+                                ],
+                              )),
+                          DropdownMenuItem(
+                              value: 'light',
+                              child: Row(
+                                children: [
+                                  Icon(Icons.light_mode, size: 20),
+                                  SizedBox(width: 8),
+                                  Text('Light Theme'),
+                                ],
+                              )),
+                          DropdownMenuItem(
+                              value: 'dark',
+                              child: Row(
+                                children: [
+                                  Icon(Icons.dark_mode, size: 20),
+                                  SizedBox(width: 8),
+                                  Text('Dark Theme'),
+                                ],
+                              )),
+                        ],
+                        onChanged: (value) {
+                          setState(() {
+                            _themeMode = value!;
+                          });
+                          _saveSettings();
+                          _applyThemeMode(value!);
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Enable periodic backup
+              Card(
+                child: SwitchListTile(
+                  secondary: const Icon(Icons.sync, color: Colors.green),
+                  title: const Text('Enable Periodic Backup'),
+                  subtitle: const Text('Automatically backup in background'),
+                  value: _isBackupEnabled,
+                  onChanged: _togglePeriodicBackup,
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Manual backup buttons
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _isBackingUp ? null : _performBackup,
+                      icon: _isBackingUp
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.backup),
+                      label:
+                          Text(_isBackingUp ? 'Backing up...' : 'Backup Now'),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.all(16),
+                        backgroundColor: Theme.of(context).colorScheme.primary,
+                        foregroundColor: Colors.white,
+                      ),
                     ),
                   ),
+                  if (_isBackingUp) ...[
+                    const SizedBox(width: 12),
+                    ElevatedButton.icon(
+                      onPressed: _stopBackup,
+                      icon: const Icon(Icons.stop),
+                      label: const Text('Stop'),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.all(16),
+                        backgroundColor: Colors.red,
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ],
                 ],
-              ],
-            ),
-            const SizedBox(height: 16),
+              ),
+              const SizedBox(height: 16),
 
-            // Status
-            Card(
-              color: _isBackingUp ? Colors.orange.shade50 : Colors.blue.shade50,
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          _isBackingUp ? Icons.sync : Icons.info_outline,
-                          color: _isBackingUp ? Colors.orange : Colors.blue,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
+              // Status
+              Card(
+                // Adaptive background for status card with better dark theme contrast
+                color: () {
+                  final scheme = Theme.of(context).colorScheme;
+                  final isDark = scheme.brightness == Brightness.dark;
+                  if (_isBackingUp) {
+                    return isDark
+                        ? scheme.surfaceVariant.withOpacity(0.35)
+                        : Colors.orange.shade50;
+                  } else {
+                    return isDark
+                        ? scheme.surfaceVariant.withOpacity(0.25)
+                        : Colors.blue.shade50;
+                  }
+                }(),
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            _isBackingUp ? Icons.sync : Icons.info_outline,
+                            color: _isBackingUp
+                                ? (Theme.of(context).colorScheme.tertiary)
+                                : Theme.of(context).colorScheme.secondary,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _status,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyLarge
+                                  ?.copyWith(
+                                    fontWeight: _isBackingUp
+                                        ? FontWeight.w500
+                                        : FontWeight.normal,
+                                    color:
+                                        Theme.of(context).colorScheme.onSurface,
+                                  ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (_deviceId != null) ...[
+                        const SizedBox(height: 6),
+                        Align(
+                          alignment: Alignment.centerLeft,
                           child: Text(
-                            _status,
+                            'Device ID: ${_deviceShortId}',
                             style:
-                                Theme.of(context).textTheme.bodyLarge?.copyWith(
-                                      fontWeight: _isBackingUp
-                                          ? FontWeight.w500
-                                          : FontWeight.normal,
+                                Theme.of(context).textTheme.bodySmall?.copyWith(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
                                     ),
                           ),
                         ),
                       ],
-                    ),
-                    if (_isBackingUp) ...[
-                      const SizedBox(height: 12),
-                      // Overall progress
-                      LinearProgressIndicator(
-                        value: _progress,
-                        backgroundColor: Theme.of(context)
-                            .colorScheme
-                            .surfaceContainerHighest,
-                        valueColor: AlwaysStoppedAnimation<Color>(
-                            Theme.of(context).colorScheme.primary),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Overall: ${(_progress * 100).toInt()}% completed ($_processedFiles/$_totalFiles files)',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-
-                      // Current file information
-                      if (_currentFileName.isNotEmpty) ...[
-                        const SizedBox(height: 16),
-                        const Divider(),
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            const Icon(Icons.insert_drive_file,
-                                size: 16, color: Colors.grey),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'Current file: $_currentFileName',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodyMedium
-                                    ?.copyWith(
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-
-                        // File progress bar
+                      if (_isBackingUp) ...[
+                        const SizedBox(height: 12),
+                        // Overall progress
                         LinearProgressIndicator(
-                          value: _currentFileProgress,
+                          value: _progress,
                           backgroundColor: Theme.of(context)
                               .colorScheme
                               .surfaceContainerHighest,
@@ -1689,66 +2060,211 @@ class _BackupHomePageState extends State<BackupHomePage>
                               Theme.of(context).colorScheme.primary),
                         ),
                         const SizedBox(height: 4),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Text(
-                              'File progress: ${(_currentFileProgress * 100).toInt()}%',
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                            Text(
-                              '${_formatBytes(_uploadedBytes)} / ${_formatBytes(_currentFileSize)}',
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                          ],
+                        Text(
+                          'Overall: ${(_progress * 100).toInt()}% completed ($_processedFiles/$_totalFiles files, skipped $_skippedFiles)',
+                          style: Theme.of(context).textTheme.bodySmall,
                         ),
 
-                        // File control buttons
-                        const SizedBox(height: 12),
+                        // Current file information
+                        if (_currentFileName.isNotEmpty) ...[
+                          const SizedBox(height: 16),
+                          const Divider(),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              const Icon(Icons.insert_drive_file,
+                                  size: 16, color: Colors.grey),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Current file: $_currentFileName',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodyMedium
+                                      ?.copyWith(
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+
+                          // File progress bar
+                          LinearProgressIndicator(
+                            value: _currentFileProgress,
+                            backgroundColor:
+                                Theme.of(context).colorScheme.surfaceVariant,
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                                Theme.of(context).colorScheme.secondary),
+                          ),
+                          const SizedBox(height: 4),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                'File progress: ${(_currentFileProgress * 100).toInt()}%',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .bodySmall
+                                    ?.copyWith(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
+                                    ),
+                              ),
+                              Text(
+                                '${_formatBytes(_uploadedBytes)} / ${_formatBytes(_currentFileSize)}',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .bodySmall
+                                    ?.copyWith(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
+                                    ),
+                              ),
+                            ],
+                          ),
+
+                          // File control buttons
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  onPressed: _cancelCurrentFile,
+                                  icon: const Icon(Icons.cancel, size: 16),
+                                  label: const Text('Cancel File',
+                                      style: TextStyle(
+                                          fontWeight: FontWeight.w600)),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.red.shade600,
+                                    foregroundColor: Colors.white,
+                                    elevation: 2,
+                                    padding: const EdgeInsets.symmetric(
+                                        vertical: 12, horizontal: 16),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  onPressed: _skipCurrentFileUpload,
+                                  icon: const Icon(Icons.skip_next, size: 16),
+                                  label: const Text('Skip File',
+                                      style: TextStyle(
+                                          fontWeight: FontWeight.w600)),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.orange.shade600,
+                                    foregroundColor: Colors.white,
+                                    elevation: 2,
+                                    padding: const EdgeInsets.symmetric(
+                                        vertical: 12, horizontal: 16),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              if (_summaryTimestamp != null && !_isBackingUp) ...[
+                const SizedBox(height: 16),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
                         Row(
                           children: [
-                            Expanded(
-                              child: ElevatedButton.icon(
-                                onPressed: _cancelCurrentFile,
-                                icon: const Icon(Icons.cancel, size: 16),
-                                label: const Text('Cancel File',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w600)),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.red.shade600,
-                                  foregroundColor: Colors.white,
-                                  elevation: 2,
-                                  padding: const EdgeInsets.symmetric(
-                                      vertical: 12, horizontal: 16),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: ElevatedButton.icon(
-                                onPressed: _skipCurrentFileUpload,
-                                icon: const Icon(Icons.skip_next, size: 16),
-                                label: const Text('Skip File',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w600)),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.orange.shade600,
-                                  foregroundColor: Colors.white,
-                                  elevation: 2,
-                                  padding: const EdgeInsets.symmetric(
-                                      vertical: 12, horizontal: 16),
-                                ),
-                              ),
+                            const Icon(Icons.assessment, color: Colors.teal),
+                            const SizedBox(width: 8),
+                            Text('Last Backup Summary',
+                                style: Theme.of(context).textTheme.titleMedium),
+                            const Spacer(),
+                            Text(
+                              _summaryTimestamp != null
+                                  ? _summaryTimestamp!
+                                      .toLocal()
+                                      .toString()
+                                      .split('.')
+                                      .first
+                                  : '',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant),
                             ),
                           ],
                         ),
+                        const SizedBox(height: 12),
+                        Wrap(
+                          runSpacing: 8,
+                          spacing: 12,
+                          children: [
+                            _MetricChip(
+                                label: 'Uploaded',
+                                value: _summaryUploadedCount.toString(),
+                                icon: Icons.cloud_done,
+                                color: Colors.green),
+                            _MetricChip(
+                                label: 'Skipped (hash)',
+                                value: _summarySkippedHashCount.toString(),
+                                icon: Icons.fingerprint,
+                                color: Colors.blueGrey),
+                            _MetricChip(
+                                label: 'Skipped (size)',
+                                value: _summarySkippedSizeCount.toString(),
+                                icon: Icons.rule,
+                                color: Colors.indigo),
+                            _MetricChip(
+                                label: 'Errors',
+                                value: _summaryErrorCount.toString(),
+                                icon: Icons.error_outline,
+                                color: Colors.redAccent),
+                            _MetricChip(
+                                label: 'Bytes',
+                                value: _formatBytes(_summaryBytesUploaded),
+                                icon: Icons.data_usage,
+                                color: Colors.deepPurple),
+                            _MetricChip(
+                                label: 'Duration',
+                                value: _formatDuration(_summaryDurationMs),
+                                icon: Icons.timer,
+                                color: Colors.orange),
+                          ],
+                        ),
+                        if (_forceReverify) ...[
+                          const SizedBox(height: 12),
+                          Row(
+                            children: const [
+                              Icon(Icons.verified,
+                                  size: 16, color: Colors.teal),
+                              SizedBox(width: 6),
+                              Text('Reverify was enabled (cache bypassed)',
+                                  style: TextStyle(fontSize: 12)),
+                            ],
+                          ),
+                        ],
                       ],
-                    ],
-                  ],
+                    ),
+                  ),
                 ),
-              ),
-            ),
-          ],
+              ],
+              // Spacer at bottom to avoid nav bar overlap
+              SizedBox(height: MediaQuery.of(context).padding.bottom + 16),
+            ],
+          ),
         ),
       ),
     );
@@ -1812,4 +2328,64 @@ class GoogleAuthClient extends http.BaseClient {
   Future<http.StreamedResponse> send(http.BaseRequest request) {
     return _client.send(request..headers.addAll(_headers));
   }
+}
+
+// Small reusable metric chip widget for summary display
+class _MetricChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final IconData icon;
+  final Color color;
+
+  const _MetricChip({
+    required this.label,
+    required this.value,
+    required this.icon,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 6),
+          Text(
+            '$label: ',
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: theme.colorScheme.onSurface.withOpacity(0.8),
+            ),
+          ),
+          Text(
+            value,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontWeight: FontWeight.w500,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Helper to format duration in ms into human readable string
+String _formatDuration(int durationMs) {
+  if (durationMs <= 0) return '0s';
+  final seconds = durationMs / 1000.0;
+  if (seconds < 60) return '${seconds.toStringAsFixed(1)}s';
+  final minutes = seconds / 60.0;
+  if (minutes < 60) return '${minutes.toStringAsFixed(1)}m';
+  final hours = minutes / 60.0;
+  return '${hours.toStringAsFixed(1)}h';
 }

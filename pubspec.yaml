@@ -30,6 +30,8 @@ dependencies:
   
   # Network connectivity
   connectivity_plus: ^6.0.5
+  device_info_plus: ^10.1.0
+  uuid: ^4.4.0
 
 dev_dependencies:
   flutter_test:

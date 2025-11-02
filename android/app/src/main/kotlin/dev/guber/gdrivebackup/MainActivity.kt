@@ -15,6 +15,7 @@ import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "dev.guber.gdrivebackup/wakelock"
@@ -27,14 +28,23 @@ class MainActivity : FlutterActivity() {
         
         createNotificationChannel()
         
+        // Event channel for streaming native backup progress/events
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "dev.guber.gdrivebackup/events").setStreamHandler(object: EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                BackupEventBus.attach(events)
+            }
+            override fun onCancel(arguments: Any?) {
+                BackupEventBus.attach(null)
+            }
+        })
+        
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "setWakeLock" -> {
                     val enabled = call.argument<Boolean>("enabled") ?: false
                     setWakeLock(enabled)
-                    if (enabled) {
-                        showBackupNotification()
-                    } else {
+                    // Foreground service owns the persistent notification; avoid duplicates
+                    if (!enabled) {
                         hideBackupNotification()
                     }
                     result.success(null)
@@ -69,6 +79,88 @@ class MainActivity : FlutterActivity() {
                 "requestUnrestrictedBattery" -> {
                     requestUnrestrictedBatteryUsage()
                     result.success(null)
+                }
+                "startBackupService" -> {
+                    val intent = Intent(this, BackupForegroundService::class.java)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+                    result.success(true)
+                }
+                "startNativeBackup" -> {
+                    val root = call.argument<String>("root")
+                    val maxMb = call.argument<Int>("maxMb") ?: 200
+                    val reverify = call.argument<Boolean>("reverify") ?: false
+                    val deviceId = call.argument<String>("deviceId")
+                    val intent = Intent(this, BackupForegroundService::class.java).apply {
+                        putExtra("native_root", root)
+                        putExtra("native_max", maxMb)
+                        putExtra("native_reverify", reverify)
+                        if (deviceId != null) putExtra("native_device_id", deviceId)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+                    result.success(true)
+                }
+                "stopBackupService" -> {
+                    stopService(Intent(this, BackupForegroundService::class.java))
+                    result.success(true)
+                }
+                "updateServiceProgress" -> {
+                    // Avoid spawning duplicate service instances; directly update existing notification
+                    val current = call.argument<Int>("current") ?: 0
+                    val total = call.argument<Int>("total") ?: 0
+                    val status = call.argument<String>("status") ?: "Backing up..."
+                    val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                    // Build lightweight notification mirroring service format if running
+                    if (BackupForegroundService.isRunning) {
+                        val pct = if (total > 0) (current * 100 / total).coerceIn(0,100) else 0
+                        val builder = androidx.core.app.NotificationCompat.Builder(this, BackupForegroundService.CHANNEL_ID)
+                            .setSmallIcon(android.R.drawable.stat_sys_upload)
+                            .setContentTitle("Drive Backup")
+                            .setContentText(status)
+                            .setOngoing(true)
+                            .setOnlyAlertOnce(true)
+                        if (total > 0) {
+                            builder.setProgress(100, pct, false)
+                        }
+                        mgr.notify(BackupForegroundService.NOTIF_ID, builder.build())
+                    }
+                    result.success(true)
+                }
+                "isBackupServiceRunning" -> {
+                    result.success(BackupForegroundService.isRunning)
+                }
+                "getBackupServiceHeartbeat" -> {
+                    val prefs = getSharedPreferences("backup_service_state", Context.MODE_PRIVATE)
+                    val ts = prefs.getLong("service_heartbeat", 0L)
+                    result.success(ts)
+                }
+                "setUserStopped" -> {
+                    val stopped = call.argument<Boolean>("stopped") ?: false
+                    val prefs = getSharedPreferences("backup_service_state", Context.MODE_PRIVATE)
+                    prefs.edit().putBoolean("user_stopped", stopped).apply()
+                    result.success(true)
+                }
+                "wasUserStopped" -> {
+                    val prefs = getSharedPreferences("backup_service_state", Context.MODE_PRIVATE)
+                    result.success(prefs.getBoolean("user_stopped", false))
+                }
+                "setAuthHeaders" -> {
+                    val headers = call.argument<Map<String, String>>("headers")
+                    if (headers != null) {
+                        val prefs = getSharedPreferences("backup_service_state", Context.MODE_PRIVATE)
+                        val json = org.json.JSONObject(headers).toString()
+                        prefs.edit().putString("auth_headers_json", json).apply()
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGS", "Headers map is null", null)
+                    }
                 }
                 else -> {
                     result.notImplemented()
