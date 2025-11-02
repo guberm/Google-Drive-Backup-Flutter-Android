@@ -13,6 +13,7 @@ import 'package:path/path.dart' as path;
 import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:uuid/uuid.dart';
+import 'package:share_plus/share_plus.dart';
 
 // Background task callback
 @pragma('vm:entry-point')
@@ -218,6 +219,16 @@ class _BackupHomePageState extends State<BackupHomePage>
   bool _wifiOnlyBackup = true; // Default to WiFi only for data saving
   String _themeMode = 'system'; // 'light', 'dark', 'system'
 
+  // Session log (native) caching for UI display
+  String _sessionLog = '';
+  bool _showSessionLog = false;
+  // Historical logs
+  List<Map<String, dynamic>> _historicalLogs = [];
+  String?
+      _selectedHistoricalLogName; // currently viewed historical log filename
+  bool _loadingHistorical = false;
+  String _logLevel = 'INFO';
+
   @override
   void initState() {
     super.initState();
@@ -259,6 +270,85 @@ class _BackupHomePageState extends State<BackupHomePage>
 
     // Subscribe to native backup events
     _subscribeToNativeEvents();
+    _loadLogLevel();
+  }
+
+  Future<void> _loadLogLevel() async {
+    const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+    try {
+      final lvl = await platform.invokeMethod<String>('getLogLevel');
+      if (!mounted) return;
+      setState(() {
+        _logLevel = (lvl ?? 'INFO');
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _setLogLevel(String level) async {
+    const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+    try {
+      await platform.invokeMethod('setLogLevel', {'level': level});
+      if (!mounted) return;
+      setState(() {
+        _logLevel = level;
+      });
+    } catch (e) {
+      print('Failed to set log level: $e');
+    }
+  }
+
+  Future<void> _refreshHistoricalLogs() async {
+    const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+    setState(() {
+      _loadingHistorical = true;
+    });
+    try {
+      final list =
+          await platform.invokeMethod<List<dynamic>>('listSessionLogFiles');
+      final cast = list
+              ?.whereType<Map>()
+              .map((m) => m.map((k, v) => MapEntry(k.toString(), v)))
+              .toList() ??
+          [];
+      // Normalize types
+      final normalized = cast
+          .map((m) => {
+                'name': m['name'],
+                'size': (m['size'] is int)
+                    ? m['size']
+                    : int.tryParse(m['size'].toString()) ?? 0,
+                'modified': (m['modified'] is int)
+                    ? m['modified']
+                    : int.tryParse(m['modified'].toString()) ?? 0,
+              })
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _historicalLogs = normalized;
+      });
+    } catch (e) {
+      print('Failed to list logs: $e');
+    }
+    if (mounted)
+      setState(() {
+        _loadingHistorical = false;
+      });
+  }
+
+  Future<void> _openHistoricalLog(String name) async {
+    const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+    try {
+      final txt = await platform
+          .invokeMethod<String>('readSessionLogFile', {'name': name});
+      if (!mounted) return;
+      setState(() {
+        _sessionLog = txt ?? '';
+        _showSessionLog = true;
+        _selectedHistoricalLogName = name;
+      });
+    } catch (e) {
+      print('Failed to read log: $e');
+    }
   }
 
   void _subscribeToNativeEvents() {
@@ -620,9 +710,6 @@ class _BackupHomePageState extends State<BackupHomePage>
 
       // Request notification permission first (needed for Android 13+)
       await platform.invokeMethod('requestNotificationPermission');
-
-      // Request unrestricted battery usage (not just optimization exemption)
-      await platform.invokeMethod('requestUnrestrictedBattery');
 
       print('✅ Unrestricted battery usage request sent');
     } catch (e) {
@@ -1196,7 +1283,8 @@ class _BackupHomePageState extends State<BackupHomePage>
     try {
       const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
       platform.invokeMethod('setUserStopped', {'stopped': true});
-      platform.invokeMethod('stopBackupService');
+      // Use explicit ACTION_STOP route (requestServiceStop)
+      platform.invokeMethod('requestServiceStop');
     } catch (e) {
       print('Failed to stop foreground service: $e');
     }
@@ -1646,6 +1734,247 @@ class _BackupHomePageState extends State<BackupHomePage>
     });
   }
 
+  // Build native backup log panel with historical logs and log level selector
+  List<Widget> _buildNativeLogPanel(BuildContext context) {
+    if (!_useNativeBackup) return [];
+
+    return [
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        const platform =
+                            MethodChannel('dev.guber.gdrivebackup/wakelock');
+                        try {
+                          final log = await platform
+                                  .invokeMethod<String>('getSessionLog') ??
+                              '';
+                          setState(() {
+                            _sessionLog = log;
+                            _showSessionLog = true;
+                            _selectedHistoricalLogName = null;
+                          });
+                        } catch (e) {
+                          print('Failed to fetch session log: $e');
+                        }
+                      },
+                      icon: const Icon(Icons.article_outlined),
+                      label: const Text('View Session Log'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _refreshHistoricalLogs,
+                      icon: const Icon(Icons.history),
+                      label: const Text('History'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  if (_showSessionLog && _sessionLog.isNotEmpty)
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          try {
+                            await Share.share(_sessionLog,
+                                subject: 'Drive Backup Session Log');
+                          } catch (e) {
+                            print('Share failed: $e');
+                          }
+                        },
+                        icon: const Icon(Icons.share),
+                        label: const Text('Share Log'),
+                      ),
+                    ),
+                  if (_historicalLogs.isNotEmpty)
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          if (!mounted) return;
+                          showModalBottomSheet(
+                              context: context,
+                              showDragHandle: true,
+                              builder: (ctx) {
+                                return SafeArea(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Padding(
+                                        padding: const EdgeInsets.all(16.0),
+                                        child: Row(
+                                          children: [
+                                            const Icon(Icons.history),
+                                            const SizedBox(width: 8),
+                                            const Text('Historical Logs',
+                                                style: TextStyle(
+                                                    fontSize: 16,
+                                                    fontWeight:
+                                                        FontWeight.bold)),
+                                            const Spacer(),
+                                            IconButton(
+                                                onPressed: () {
+                                                  Navigator.pop(ctx);
+                                                },
+                                                icon: const Icon(Icons.close)),
+                                          ],
+                                        ),
+                                      ),
+                                      if (_loadingHistorical)
+                                        const Padding(
+                                          padding: EdgeInsets.all(16.0),
+                                          child: Center(
+                                              child:
+                                                  CircularProgressIndicator()),
+                                        )
+                                      else
+                                        Expanded(
+                                          child: ListView.builder(
+                                            itemCount: _historicalLogs.length,
+                                            itemBuilder: (c, i) {
+                                              final e = _historicalLogs[i];
+                                              final name =
+                                                  e['name'] as String? ?? '';
+                                              final size =
+                                                  e['size'] as int? ?? 0;
+                                              final modified = DateTime
+                                                  .fromMillisecondsSinceEpoch(
+                                                      (e['modified'] as int?) ??
+                                                          0);
+                                              return ListTile(
+                                                dense: true,
+                                                title: Text(name,
+                                                    style: const TextStyle(
+                                                        fontSize: 13)),
+                                                subtitle: Text(
+                                                    '${_formatBytes(size)}  •  ${modified.toLocal().toString().split('.').first}',
+                                                    style: const TextStyle(
+                                                        fontSize: 11)),
+                                                leading: const Icon(
+                                                    Icons.description_outlined,
+                                                    size: 18),
+                                                onTap: () {
+                                                  Navigator.pop(ctx);
+                                                  _openHistoricalLog(name);
+                                                },
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                );
+                              });
+                        },
+                        icon: const Icon(Icons.list_alt),
+                        label: const Text('Show Logs'),
+                      ),
+                    ),
+                ],
+              ),
+              if (_showSessionLog) ...[
+                const SizedBox(height: 8),
+                Container(
+                  constraints: const BoxConstraints(maxHeight: 200),
+                  decoration: BoxDecoration(
+                    border: Border.all(
+                        color: Theme.of(context).colorScheme.outlineVariant),
+                    borderRadius: BorderRadius.circular(8),
+                    color: Theme.of(context)
+                        .colorScheme
+                        .surfaceVariant
+                        .withOpacity(0.3),
+                  ),
+                  child: Scrollbar(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(8),
+                      child: Text(
+                        _sessionLog.isEmpty
+                            ? 'No log entries yet'
+                            : _sessionLog,
+                        style: const TextStyle(
+                            fontFamily: 'monospace', fontSize: 11),
+                      ),
+                    ),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: () async {
+                      const platform =
+                          MethodChannel('dev.guber.gdrivebackup/wakelock');
+                      try {
+                        await platform.invokeMethod('clearSessionLog');
+                        setState(() {
+                          _sessionLog = '';
+                          _selectedHistoricalLogName = null;
+                        });
+                      } catch (e) {
+                        print('Clear log failed: $e');
+                      }
+                    },
+                    icon: const Icon(Icons.clear),
+                    label: const Text('Clear Log'),
+                  ),
+                ),
+                if (_selectedHistoricalLogName != null)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 4.0, left: 4.0),
+                      child: Text(
+                          'Viewing historical: $_selectedHistoricalLogName',
+                          style: Theme.of(context).textTheme.bodySmall),
+                    ),
+                  ),
+                const SizedBox(height: 8),
+              ],
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  const Text('Log Level:'),
+                  const SizedBox(width: 12),
+                  DropdownButton<String>(
+                    value: _logLevel,
+                    items: const [
+                      DropdownMenuItem(value: 'INFO', child: Text('INFO')),
+                      DropdownMenuItem(value: 'DEBUG', child: Text('DEBUG')),
+                    ],
+                    onChanged: (val) {
+                      if (val != null) {
+                        _setLogLevel(val);
+                      }
+                    },
+                  ),
+                  if (_historicalLogs.isEmpty && _loadingHistorical)
+                    const Padding(
+                      padding: EdgeInsets.only(left: 16.0),
+                      child: SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2)),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    ];
+  }
+
   // (Removed) Simulated upload progress now replaced by real stream-based progress tracking
 
   @override
@@ -1957,7 +2286,6 @@ class _BackupHomePageState extends State<BackupHomePage>
                       icon: _isBackingUp
                           ? const SizedBox(
                               width: 20,
-                              height: 20,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.backup),
@@ -2174,6 +2502,7 @@ class _BackupHomePageState extends State<BackupHomePage>
                   ),
                 ),
               ),
+              ..._buildNativeLogPanel(context),
               if (_summaryTimestamp != null && !_isBackingUp) ...[
                 const SizedBox(height: 16),
                 Card(

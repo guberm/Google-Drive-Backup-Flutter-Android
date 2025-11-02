@@ -76,6 +76,8 @@ class BackupForegroundService : Service() {
         backupJob = serviceScope.launch {
             try {
                 val startTimeMs = System.currentTimeMillis()
+                SessionLog.clear()
+                SessionLog.log("Backup session started root=$rootPath maxSizeMB=$maxSizeMB reverify=$reverify device=${deviceIdShortOverride}")
                 var uploadedCount = 0
                 var skippedHashCount = 0
                 var skippedSizeCount = 0
@@ -85,6 +87,7 @@ class BackupForegroundService : Service() {
                 if (!root.exists() || !root.isDirectory) {
                     updateNotification("Folder not found")
                     BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to "Folder not found"))
+                    SessionLog.log("ERROR folder not found: $rootPath")
                     return@launch
                 }
                 
@@ -94,6 +97,7 @@ class BackupForegroundService : Service() {
                 if (headersJson == null) {
                     updateNotification("Auth headers missing")
                     BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to "Auth headers not set"))
+                    SessionLog.log("ERROR auth headers missing – aborting")
                     return@launch
                 }
                 val authHeaders = parseAuthHeaders(headersJson)
@@ -102,6 +106,7 @@ class BackupForegroundService : Service() {
                 totalFiles = scanCountFiles(root, maxSizeBytes)
                 processedFiles = 0
                 updateNotification("Scanning complete: $totalFiles files")
+                SessionLog.log("Scan complete totalFiles=$totalFiles")
                 // Provide both scan_complete and initial progress with consistent keys
                 val scanEvent = mapOf<String, Any>(
                     "type" to "scan_complete",
@@ -124,6 +129,7 @@ class BackupForegroundService : Service() {
                 if (appBackupId == null) {
                     updateNotification("Failed to create backup folder")
                     BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to "Failed to create backup folder"))
+                    SessionLog.log("ERROR failed to create/find device root folder $deviceRootName")
                     return@launch
                 }
                 
@@ -133,8 +139,10 @@ class BackupForegroundService : Service() {
                 if (targetFolderId == null) {
                     updateNotification("Failed to create target folder")
                     BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to "Failed to create target folder"))
+                    SessionLog.log("ERROR failed to create/find target folder $folderName under $deviceRootName")
                     return@launch
                 }
+                SessionLog.log("Target root Drive folder id=$targetFolderId name=$folderName")
 
                 // Load cached metadata (if any) for existing remote files
                 val cacheFile = File(filesDir, "drive_cache_${targetFolderId}.json")
@@ -148,24 +156,50 @@ class BackupForegroundService : Service() {
                 if (remoteMap.isEmpty() || reverify) {
                     remoteMap = fetchExistingFilesMap(authHeaders, targetFolderId)
                     android.util.Log.i("BackupService","[prefetch] fetched remote files count=${remoteMap.size}")
+                    SessionLog.log("Fetched remote top-level listing count=${remoteMap.size} reverify=$reverify")
                     writeCacheMap(cacheFile, remoteMap)
                 } else {
                     android.util.Log.i("BackupService","[cache] using cached remote files count=${remoteMap.size}")
+                    SessionLog.log("Using cached remote top-level metadata count=${remoteMap.size}")
                 }
 
-                // Upload files (skip if identical exists); emit detailed logs
+                // Prepare hierarchical folder + per-folder remote metadata caches
+                val folderPathIdCache = HashMap<String, String>() // relativePath -> folderId ("" => targetFolderId)
+                folderPathIdCache[""] = targetFolderId
+                val perFolderRemoteMap = HashMap<String, MutableMap<String, Triple<String, Long, String?>>>()
+                perFolderRemoteMap[targetFolderId] = remoteMap.toMutableMap()
+
+                // Upload files preserving relative directory structure
                 root.walkTopDown().filter { it.isFile && it.length() <= maxSizeBytes }.forEach { file ->
                     if (!isRunning) return@launch
 
                     val fileName = file.name
+                    // Determine relative directory ("" if file directly under root)
+                    val parentFile = file.parentFile
+                    val relativeDir = if (parentFile == root) "" else parentFile.relativeTo(root).path.replace(File.separatorChar, '/')
+                    // Ensure (possibly nested) remote folder exists
+                    val folderId = ensureRemotePath(authHeaders, relativeDir, targetFolderId, folderPathIdCache)
+                    if (folderId == null) {
+                        SessionLog.log("ERROR could not create remote path '$relativeDir' for file $fileName – skipping")
+                        return@forEach
+                    }
+                    // Acquire or fetch remote listing for this folder
+                    val folderRemoteMap = perFolderRemoteMap.getOrPut(folderId) {
+                        SessionLog.log("Listing remote folder for path='$relativeDir'")
+                        fetchExistingFilesMap(authHeaders, folderId).toMutableMap()
+                    }
                     val localSize = file.length()
-                    val remoteMeta = remoteMap[fileName]
+                    val remoteMeta = folderRemoteMap[fileName]
                     var localMd5: String? = null
+                    var md5Start: Long
                     if (remoteMeta != null && remoteMeta.second == localSize) {
                         // Compute md5 only if sizes match
+                        md5Start = System.currentTimeMillis()
                         localMd5 = computeFileMd5(file)
+                        SessionLog.log("MD5 time ms=${System.currentTimeMillis()-md5Start} file=$fileName path=$relativeDir")
                         if (localMd5 != null && localMd5.equals(remoteMeta.third, ignoreCase = true)) {
                             android.util.Log.i("BackupService","[skip] $fileName hash+size match processed=$processedFiles/$totalFiles")
+                            SessionLog.log("SKIP hash+size match file=$fileName path=$relativeDir size=$localSize md5=$localMd5")
                             processedFiles++
                             skippedHashCount++
                             BackupEventBus.emit(mapOf<String, Any>(
@@ -192,6 +226,7 @@ class BackupForegroundService : Service() {
                             "fileName" to fileName,
                             "reason" to "Already exists (size match)"
                         ))
+                        SessionLog.log("SKIP size match (no hash) file=$fileName path=$relativeDir size=$localSize")
                         updateNotification("Skipping $fileName ($processedFiles/$totalFiles)", processedFiles, totalFiles, fileName)
                         BackupEventBus.emit(mapOf<String, Any>(
                             "type" to "native_progress",
@@ -203,6 +238,7 @@ class BackupForegroundService : Service() {
                     }
 
                     android.util.Log.i("BackupService","[start] file=$fileName size=${file.length()} processed=$processedFiles/$totalFiles")
+                    SessionLog.log("START file=$fileName path=$relativeDir size=$localSize")
                     BackupEventBus.emit(mapOf<String, Any>(
                         "type" to "file_start",
                         "fileName" to fileName,
@@ -210,10 +246,13 @@ class BackupForegroundService : Service() {
                     ))
                     updateNotification("Uploading $fileName ($processedFiles/$totalFiles)", processedFiles, totalFiles, fileName)
 
-                    val uploaded = uploadFileResumable(authHeaders, file, targetFolderId).also { success ->
+                    val fileStartMs = System.currentTimeMillis()
+                    val uploaded = uploadFileResumable(authHeaders, file, folderId).also { success ->
                         if (success) {
                             uploadedCount++
                             bytesUploaded += localSize
+                            // Add to folder remote map for potential subsequent duplicate detection
+                            folderRemoteMap[fileName] = Triple("?", localSize, computeFileMd5(file))
                         } else {
                             errorCount++
                         }
@@ -222,12 +261,14 @@ class BackupForegroundService : Service() {
 
                     if (uploaded) {
                         android.util.Log.i("BackupService","[done] file=$fileName processed=$processedFiles/$totalFiles")
+                        SessionLog.log("DONE file=$fileName path=$relativeDir durationMs=${System.currentTimeMillis()-fileStartMs}")
                         BackupEventBus.emit(mapOf<String, Any>(
                             "type" to "file_done",
                             "fileName" to fileName
                         ))
                     } else {
                         android.util.Log.e("BackupService","[error] file=$fileName upload failed processed=$processedFiles/$totalFiles")
+                        SessionLog.log("ERROR upload failed file=$fileName path=$relativeDir durationMs=${System.currentTimeMillis()-fileStartMs}")
                         BackupEventBus.emit(mapOf<String, Any>(
                             "type" to "file_error",
                             "fileName" to fileName,
@@ -255,6 +296,14 @@ class BackupForegroundService : Service() {
                     ))
                 }
                 val durationMs = System.currentTimeMillis() - startTimeMs
+                SessionLog.log("SUMMARY processed=$processedFiles uploaded=$uploadedCount skippedHash=$skippedHashCount skippedSize=$skippedSizeCount errors=$errorCount bytes=$bytesUploaded durationMs=$durationMs userCancelled=$userCancelled")
+                val statusSuffix = when {
+                    userCancelled -> "cancelled"
+                    errorCount > 0 -> "err$errorCount"
+                    else -> "ok"
+                }
+                val fileName = "session_log_${System.currentTimeMillis()}_${statusSuffix}.txt"
+                SessionLog.persistToFile(filesDir, fileName)
                 BackupEventBus.emit(mapOf<String, Any>(
                     "type" to "native_summary",
                     "uploadedCount" to uploadedCount,
@@ -274,15 +323,39 @@ class BackupForegroundService : Service() {
                             "status" to "Cancelled by user"
                         ))
                     }
+                    SessionLog.log("CANCELLED processed=$processedFiles/$totalFiles")
                 } else {
                     updateNotification("Error: ${e.message}")
                     BackupEventBus.emit(mapOf<String, Any>(
                         "type" to "error",
                         "message" to (e.message ?: "Unknown error") as Any
                     ))
+                    SessionLog.log("ERROR exception ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
         }
+    }
+
+    // Ensure nested remote path hierarchy (relativeDir like "sub/inner"). Returns folderId for final segment
+    private suspend fun ensureRemotePath(authHeaders: Map<String, String>, relativeDir: String, rootFolderId: String, cache: MutableMap<String, String>): String? {
+        if (relativeDir.isEmpty()) return rootFolderId
+        val segments = relativeDir.split('/')
+        var currentPath = ""
+        var parentId = rootFolderId
+        for (seg in segments) {
+            currentPath = if (currentPath.isEmpty()) seg else "$currentPath/$seg"
+            val cached = cache[currentPath]
+            if (cached != null) {
+                parentId = cached
+                continue
+            }
+            val id = getOrCreateFolder(authHeaders, seg, parentId)
+            if (id == null) return null
+            cache[currentPath] = id
+            parentId = id
+            SessionLog.log("Created/Found folder '$seg' path='$currentPath' id=$id")
+        }
+        return parentId
     }
 
     // Fetch existing files metadata (name -> Triple<id,size,md5>)
@@ -500,6 +573,7 @@ class BackupForegroundService : Service() {
             var uploadedBytes = 0L
             
             var lastChunkEmitted = 0
+            var nextPctMilestone = 10
             FileInputStream(file).use { fis ->
                 val buffer = ByteArray(chunkSize)
                 var bytesRead: Int
@@ -525,9 +599,11 @@ class BackupForegroundService : Service() {
                             success = true
                         } else {
                             android.util.Log.w("BackupService","[chunk-retry] file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader")
+                            SessionLog.log("CHUNK_RETRY file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader")
                             attempt++
                             if (attempt >= 3) {
                                 android.util.Log.e("BackupService","[chunk-fail] file=$fileName code=$respCode range=$rangeHeader")
+                                SessionLog.log("CHUNK_FAIL file=$fileName code=$respCode range=$rangeHeader")
                                 return@withContext false
                             }
                             // small backoff
@@ -551,6 +627,11 @@ class BackupForegroundService : Service() {
                         ))
                         updateNotification("Uploading $processedFiles/$totalFiles", processedFiles, totalFiles, fileName)
                     }
+                    val pctInt = (progress * 100).toInt().coerceIn(0,100)
+                    if (pctInt >= nextPctMilestone) {
+                        SessionLog.log("CHUNK progress file=$fileName ${pctInt}% bytes=$uploadedBytes/$fileSize")
+                        nextPctMilestone += 10
+                    }
                     lastChunkEmitted++
                     
                     if (finalCode == 200 || finalCode == 201) {
@@ -566,9 +647,11 @@ class BackupForegroundService : Service() {
             true
         } catch (ce: java.util.concurrent.CancellationException) {
             android.util.Log.i("BackupService", "Upload cancelled for ${file.name}")
+            SessionLog.log("UPLOAD_CANCELLED file=${file.name}")
             false
         } catch (e: Exception) {
             android.util.Log.e("BackupService", "Error uploading file: $e")
+            SessionLog.log("ERROR uploading file=${file.name} ex=${e.javaClass.simpleName} msg=${e.message}")
             false
         }
     }
@@ -647,6 +730,7 @@ class BackupForegroundService : Service() {
                 "total" to totalFiles,
                 "status" to "Cancelled by user"
             ))
+            SessionLog.log("ACTION_STOP received – user cancelled")
 
             // Remove foreground notification
             try {

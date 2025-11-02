@@ -108,7 +108,14 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "stopBackupService" -> {
-                    stopService(Intent(this, BackupForegroundService::class.java))
+                    // Use ACTION_STOP intent so service performs structured cancellation & notifications
+                    val stopIntent = Intent(this, BackupForegroundService::class.java).apply { action = BackupForegroundService.ACTION_STOP }
+                    startService(stopIntent)
+                    result.success(true)
+                }
+                "requestServiceStop" -> { // alias explicit stop
+                    val stopIntent = Intent(this, BackupForegroundService::class.java).apply { action = BackupForegroundService.ACTION_STOP }
+                    startService(stopIntent)
                     result.success(true)
                 }
                 "updateServiceProgress" -> {
@@ -161,6 +168,47 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.error("INVALID_ARGS", "Headers map is null", null)
                     }
+                }
+                "getSessionLog" -> {
+                    result.success(SessionLog.getLog())
+                }
+                "clearSessionLog" -> {
+                    SessionLog.clear()
+                    result.success(true)
+                }
+                "listSessionLogFiles" -> {
+                    try {
+                        val files = SessionLog.listLogFiles(filesDir)
+                        val arr = files.map { mapOf(
+                            "name" to it.first,
+                            "size" to it.second,
+                            "modified" to it.third
+                        ) }
+                        result.success(arr)
+                    } catch (e: Exception) {
+                        result.error("LIST_FAIL", e.message, null)
+                    }
+                }
+                "readSessionLogFile" -> {
+                    val name = call.argument<String>("name")
+                    if (name.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "name missing", null)
+                    } else {
+                        val txt = SessionLog.readLogFile(filesDir, name)
+                        if (txt == null) result.error("NOT_FOUND", "File not found", null) else result.success(txt)
+                    }
+                }
+                "setLogLevel" -> {
+                    val level = call.argument<String>("level")
+                    if (level == null) {
+                        result.error("INVALID_ARGS", "level required", null)
+                    } else {
+                        val ok = SessionLog.setLevel(this, level)
+                        if (ok) result.success(true) else result.error("INVALID_LEVEL", "Unknown level $level", null)
+                    }
+                }
+                "getLogLevel" -> {
+                    result.success(SessionLog.getLevel(this))
                 }
                 else -> {
                     result.notImplemented()
