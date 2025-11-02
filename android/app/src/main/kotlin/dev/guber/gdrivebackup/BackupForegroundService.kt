@@ -479,7 +479,6 @@ class BackupForegroundService : Service() {
                 if (files != null && files.length() > 0) {
                     return@withContext files.getJSONObject(0).getString("id")
                 }
-                            updateNotification("Cancelled by user", processedFiles, totalFiles)
             }
             
             // Create folder
@@ -556,12 +555,17 @@ class BackupForegroundService : Service() {
             initConn.requestMethod = if (existingFileId != null) "PATCH" else "POST"
             initConn.doOutput = true
             initConn.outputStream.write(metadata.toString().toByteArray())
-            
-            if (initConn.responseCode !in 200..299) {
-                android.util.Log.e("BackupService", "Failed to initiate upload for $fileName: ${initConn.responseCode}")
+
+            val initCode = initConn.responseCode
+            if (initCode !in 200..299) {
+                val errBody = try { initConn.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
+                SessionLog.log("ERROR upload_init_failed file=$fileName code=$initCode body=${errBody ?: "(none)"}")
+                android.util.Log.e("BackupService", "Failed to initiate upload for $fileName code=$initCode body=${errBody ?: "(none)"}")
                 return@withContext false
+            } else {
+                SessionLog.log("UPLOAD_INIT file=$fileName code=$initCode mode=${if (existingFileId!=null) "PATCH" else "POST"}")
             }
-            
+
             val sessionUri = initConn.getHeaderField("Location")
             if (sessionUri == null) {
                 android.util.Log.e("BackupService", "No session URI for $fileName")
@@ -571,9 +575,35 @@ class BackupForegroundService : Service() {
             // Upload file in chunks
             val chunkSize = 256 * 1024 // 256 KB
             var uploadedBytes = 0L
-            
             var lastChunkEmitted = 0
             var nextPctMilestone = 10
+            var lastFinalResponseCode = -1
+            var lastRangeHeader: String? = null
+
+            fun queryUploadStatus(): Long {
+                return try {
+                    val statusConn = URL(sessionUri).openConnection() as HttpURLConnection
+                    statusConn.requestMethod = "PUT"
+                    statusConn.setRequestProperty("Content-Range", "bytes */$fileSize")
+                    // No body
+                    val code = statusConn.responseCode
+                    val range = statusConn.getHeaderField("Range")
+                    if (code == 308 && range != null) {
+                        // Range format: bytes=0-<lastByte>
+                        val parts = range.split('=')
+                        if (parts.size == 2) {
+                            val span = parts[1]
+                            val end = span.substringAfter('-').toLongOrNull()
+                            if (end != null) return end + 1
+                        }
+                    }
+                    uploadedBytes // fallback
+                } catch (e: Exception) {
+                    SessionLog.log("WARN status_query_failed file=$fileName ex=${e.javaClass.simpleName} msg=${e.message}")
+                    uploadedBytes
+                }
+            }
+
             FileInputStream(file).use { fis ->
                 val buffer = ByteArray(chunkSize)
                 var bytesRead: Int
@@ -584,9 +614,10 @@ class BackupForegroundService : Service() {
                     val endByte = uploadedBytes + bytesRead - 1
                     val rangeHeader = "bytes $uploadedBytes-$endByte/$fileSize"
                     
-                    var respCode = -1
                     var attempt = 0
                     var success = false
+                    var respCode = -1
+                    var lastErrorBody: String? = null
                     while (attempt < 3 && !success) {
                         val uploadConn = URL(sessionUri).openConnection() as HttpURLConnection
                         uploadConn.setRequestProperty("Content-Length", bytesRead.toString())
@@ -598,16 +629,22 @@ class BackupForegroundService : Service() {
                         if (respCode in listOf(200,201,308)) {
                             success = true
                         } else {
-                            android.util.Log.w("BackupService","[chunk-retry] file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader")
-                            SessionLog.log("CHUNK_RETRY file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader")
+                            lastErrorBody = try { uploadConn.errorStream?.bufferedReader()?.readText()?.take(200) } catch (_: Exception) { null }
+                            android.util.Log.w("BackupService","[chunk-retry] file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader body=${lastErrorBody ?: "(none)"}")
+                            SessionLog.log("CHUNK_RETRY file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader body=${lastErrorBody ?: "(none)"}")
                             attempt++
                             if (attempt >= 3) {
-                                android.util.Log.e("BackupService","[chunk-fail] file=$fileName code=$respCode range=$rangeHeader")
-                                SessionLog.log("CHUNK_FAIL file=$fileName code=$respCode range=$rangeHeader")
+                                val statusUploaded = queryUploadStatus()
+                                android.util.Log.e("BackupService","[chunk-fail] file=$fileName code=$respCode uploaded=$statusUploaded/$fileSize range=$rangeHeader body=${lastErrorBody ?: "(none)"}")
+                                SessionLog.log("CHUNK_FAIL file=$fileName code=$respCode uploaded=$statusUploaded/$fileSize range=$rangeHeader body=${lastErrorBody ?: "(none)"}")
                                 return@withContext false
                             }
-                            // small backoff
-                            try { Thread.sleep(500L * attempt) } catch (_: InterruptedException) {}
+                            try { Thread.sleep(500L * (attempt)) } catch (_: InterruptedException) {}
+                            val statusBytes = queryUploadStatus()
+                            if (statusBytes > uploadedBytes) {
+                                SessionLog.log("STATUS_RECOVER file=$fileName serverBytes=$statusBytes localBytes=$uploadedBytes")
+                                uploadedBytes = statusBytes
+                            }
                             continue
                         }
                     }
@@ -615,6 +652,8 @@ class BackupForegroundService : Service() {
                     val finalCode = if (success) respCode else -1
                     uploadedBytes += bytesRead
                     
+                    lastFinalResponseCode = finalCode
+                    lastRangeHeader = rangeHeader
                     // Emit file progress (throttle every 4 chunks)
                     val progress = uploadedBytes.toDouble() / fileSize
                     if (lastChunkEmitted % 4 == 0 || uploadedBytes == fileSize) {
@@ -636,15 +675,23 @@ class BackupForegroundService : Service() {
                     
                     if (finalCode == 200 || finalCode == 201) {
                         // Upload complete
+                        SessionLog.log("UPLOAD_COMPLETE file=$fileName size=$fileSize")
                         return@withContext true
-                    } else if (finalCode !in 308..308) {
+                    } else if (finalCode == 308) {
+                        // continue
+                    } else if (finalCode != -1) {
                         android.util.Log.e("BackupService", "Upload chunk failed for $fileName: $finalCode")
+                        SessionLog.log("ERROR chunk_failed file=$fileName code=$finalCode range=$rangeHeader")
                         return@withContext false
                     }
                 }
             }
-            
-            true
+            // Verify completion: need a final 200/201
+            val success = (uploadedBytes == fileSize) && (lastFinalResponseCode == 200 || lastFinalResponseCode == 201)
+            if (!success) {
+                SessionLog.log("ERROR incomplete_upload file=$fileName uploaded=$uploadedBytes/$fileSize lastCode=$lastFinalResponseCode lastRange=${lastRangeHeader ?: "(none)"}")
+            }
+            success
         } catch (ce: java.util.concurrent.CancellationException) {
             android.util.Log.i("BackupService", "Upload cancelled for ${file.name}")
             SessionLog.log("UPLOAD_CANCELLED file=${file.name}")
@@ -742,6 +789,8 @@ class BackupForegroundService : Service() {
                 // Explicit cancel to ensure disappearance
                 val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 mgr.cancel(NOTIF_ID)
+                // Post a short-lived non-ongoing cancellation notification for user feedback
+                postCancelledNotification(processedFiles, totalFiles)
             } catch (_: Exception) {}
             stopSelf()
             return START_NOT_STICKY
@@ -818,5 +867,28 @@ class BackupForegroundService : Service() {
                 .setSubText("$progress/$total")
         }
         return builder.build()
+    }
+
+    // Show a brief cancellation notification so the user sees confirmation after tapping Stop.
+    private fun postCancelledNotification(processed: Int, total: Int) {
+        try {
+            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle("Drive Backup")
+                .setContentText("Cancelled by user ($processed/$total)")
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+            // Use different ID so it doesn't clash with ongoing one
+            val cancelId = NOTIF_ID + 1
+            mgr.notify(cancelId, builder.build())
+            // Auto remove after 5 seconds
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try { mgr.cancel(cancelId) } catch (_: Exception) {}
+            }, 5000)
+        } catch (e: Exception) {
+            android.util.Log.e("BackupService", "postCancelledNotification error: $e")
+        }
     }
 }

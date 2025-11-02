@@ -14,6 +14,7 @@ import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:uuid/uuid.dart';
 import 'package:share_plus/share_plus.dart';
+import 'dart:convert';
 
 // Background task callback
 @pragma('vm:entry-point')
@@ -228,6 +229,8 @@ class _BackupHomePageState extends State<BackupHomePage>
       _selectedHistoricalLogName; // currently viewed historical log filename
   bool _loadingHistorical = false;
   String _logLevel = 'INFO';
+  bool _sharingLog = false; // sharing in progress flag to avoid multiple taps
+  bool _forcePlainTextShare = false; // user toggle to disable gzip compression
 
   @override
   void initState() {
@@ -349,6 +352,87 @@ class _BackupHomePageState extends State<BackupHomePage>
     } catch (e) {
       print('Failed to read log: $e');
     }
+  }
+
+  // Share current (or selected historical) session log as a file attachment.
+  // This avoids freezing the UI when the log is very large by not passing a huge text payload
+  // through the platform share intent. If the log exceeds 64KB, gzip compress it.
+  Future<void> _shareCurrentLog() async {
+    if (_sharingLog) return;
+    if (_sessionLog.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Log is empty – nothing to share')),
+        );
+      }
+      return;
+    }
+    setState(() {
+      _sharingLog = true;
+    });
+    try {
+      // Decide on compression threshold (matching native persistence threshold)
+      final shouldCompress =
+          !_forcePlainTextShare && _sessionLog.length > 64 * 1024;
+      final baseName = _selectedHistoricalLogName ?? 'session_log_current.txt';
+      // Ensure baseName safe
+      final safeName = baseName.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+      final fileName = shouldCompress
+          ? (safeName.endsWith('.gz') ? safeName : '$safeName.gz')
+          : safeName;
+      final tempDirPath = Directory.systemTemp.path;
+      final filePath = path.join(tempDirPath, fileName);
+      final file = File(filePath);
+      if (shouldCompress) {
+        final bytes = utf8.encode(_sessionLog);
+        final gzBytes = GZipCodec().encode(bytes);
+        await file.writeAsBytes(gzBytes, flush: true);
+      } else {
+        await file.writeAsString(_sessionLog, flush: true);
+      }
+      final mimeType = shouldCompress ? 'application/gzip' : 'text/plain';
+      final xFile = XFile(file.path, mimeType: mimeType, name: fileName);
+      await Share.shareXFiles(
+        [xFile],
+        subject: 'Drive Backup Session Log',
+        text: 'Attached session log: $fileName',
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(
+                  'Shared log as ${shouldCompress ? 'gzip' : 'plain text'} attachment')),
+        );
+      }
+    } catch (e) {
+      print('Share failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to share log: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sharingLog = false;
+        });
+      }
+    }
+  }
+
+  void _copyLogToClipboard() {
+    if (_sessionLog.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Log is empty – nothing to copy')),
+      );
+      return;
+    }
+    Clipboard.setData(ClipboardData(text: _sessionLog));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+          content:
+              Text('Copied ${_sessionLog.length} characters to clipboard')),
+    );
   }
 
   void _subscribeToNativeEvents() {
@@ -1785,16 +1869,16 @@ class _BackupHomePageState extends State<BackupHomePage>
                   if (_showSessionLog && _sessionLog.isNotEmpty)
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: () async {
-                          try {
-                            await Share.share(_sessionLog,
-                                subject: 'Drive Backup Session Log');
-                          } catch (e) {
-                            print('Share failed: $e');
-                          }
-                        },
-                        icon: const Icon(Icons.share),
-                        label: const Text('Share Log'),
+                        onPressed: _sharingLog ? null : _shareCurrentLog,
+                        icon: _sharingLog
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.share),
+                        label: Text(_sharingLog ? 'Sharing...' : 'Share Log'),
                       ),
                     ),
                   if (_historicalLogs.isNotEmpty)
@@ -1803,86 +1887,116 @@ class _BackupHomePageState extends State<BackupHomePage>
                         onPressed: () async {
                           if (!mounted) return;
                           showModalBottomSheet(
-                              context: context,
-                              showDragHandle: true,
-                              builder: (ctx) {
-                                return SafeArea(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Padding(
-                                        padding: const EdgeInsets.all(16.0),
-                                        child: Row(
-                                          children: [
-                                            const Icon(Icons.history),
-                                            const SizedBox(width: 8),
-                                            const Text('Historical Logs',
-                                                style: TextStyle(
-                                                    fontSize: 16,
-                                                    fontWeight:
-                                                        FontWeight.bold)),
-                                            const Spacer(),
-                                            IconButton(
-                                                onPressed: () {
-                                                  Navigator.pop(ctx);
-                                                },
-                                                icon: const Icon(Icons.close)),
-                                          ],
+                            context: context,
+                            showDragHandle: true,
+                            builder: (ctx) {
+                              return SafeArea(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Padding(
+                                      padding: const EdgeInsets.all(16.0),
+                                      child: Row(
+                                        children: [
+                                          const Icon(Icons.history),
+                                          const SizedBox(width: 8),
+                                          const Text('Historical Logs',
+                                              style: TextStyle(
+                                                  fontSize: 16,
+                                                  fontWeight: FontWeight.bold)),
+                                          const Spacer(),
+                                          IconButton(
+                                            onPressed: () => Navigator.pop(ctx),
+                                            icon: const Icon(Icons.close),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    if (_loadingHistorical)
+                                      const Padding(
+                                        padding: EdgeInsets.all(16.0),
+                                        child: Center(
+                                          child: CircularProgressIndicator(),
+                                        ),
+                                      )
+                                    else
+                                      Expanded(
+                                        child: ListView.builder(
+                                          itemCount: _historicalLogs.length,
+                                          itemBuilder: (c, i) {
+                                            final e = _historicalLogs[i];
+                                            final name =
+                                                e['name'] as String? ?? '';
+                                            final size = e['size'] as int? ?? 0;
+                                            final modified = DateTime
+                                                .fromMillisecondsSinceEpoch(
+                                                    (e['modified'] as int?) ??
+                                                        0);
+                                            return ListTile(
+                                              dense: true,
+                                              title: Text(name,
+                                                  style: const TextStyle(
+                                                      fontSize: 13)),
+                                              subtitle: Text(
+                                                '${_formatBytes(size)}  •  ${modified.toLocal().toString().split('.').first}',
+                                                style: const TextStyle(
+                                                    fontSize: 11),
+                                              ),
+                                              leading: const Icon(
+                                                Icons.description_outlined,
+                                                size: 18,
+                                              ),
+                                              onTap: () {
+                                                Navigator.pop(ctx);
+                                                _openHistoricalLog(name);
+                                              },
+                                            );
+                                          },
                                         ),
                                       ),
-                                      if (_loadingHistorical)
-                                        const Padding(
-                                          padding: EdgeInsets.all(16.0),
-                                          child: Center(
-                                              child:
-                                                  CircularProgressIndicator()),
-                                        )
-                                      else
-                                        Expanded(
-                                          child: ListView.builder(
-                                            itemCount: _historicalLogs.length,
-                                            itemBuilder: (c, i) {
-                                              final e = _historicalLogs[i];
-                                              final name =
-                                                  e['name'] as String? ?? '';
-                                              final size =
-                                                  e['size'] as int? ?? 0;
-                                              final modified = DateTime
-                                                  .fromMillisecondsSinceEpoch(
-                                                      (e['modified'] as int?) ??
-                                                          0);
-                                              return ListTile(
-                                                dense: true,
-                                                title: Text(name,
-                                                    style: const TextStyle(
-                                                        fontSize: 13)),
-                                                subtitle: Text(
-                                                    '${_formatBytes(size)}  •  ${modified.toLocal().toString().split('.').first}',
-                                                    style: const TextStyle(
-                                                        fontSize: 11)),
-                                                leading: const Icon(
-                                                    Icons.description_outlined,
-                                                    size: 18),
-                                                onTap: () {
-                                                  Navigator.pop(ctx);
-                                                  _openHistoricalLog(name);
-                                                },
-                                              );
-                                            },
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                );
-                              });
+                                  ],
+                                ),
+                              );
+                            },
+                          );
                         },
-                        icon: const Icon(Icons.list_alt),
-                        label: const Text('Show Logs'),
+                        icon: const Icon(Icons.history),
+                        label: const Text('History'),
+                      ),
+                    ),
+                  if (_showSessionLog && _sessionLog.isNotEmpty)
+                    const SizedBox(width: 12),
+                  if (_showSessionLog && _sessionLog.isNotEmpty)
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _copyLogToClipboard,
+                        icon: const Icon(Icons.copy_all_outlined),
+                        label: const Text('Copy'),
                       ),
                     ),
                 ],
               ),
+              if (_showSessionLog && _sessionLog.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: SwitchListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Force plain-text sharing'),
+                        subtitle: const Text('Disable gzip for large logs'),
+                        value: _forcePlainTextShare,
+                        onChanged: (v) {
+                          setState(() {
+                            _forcePlainTextShare = v;
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
               if (_showSessionLog) ...[
                 const SizedBox(height: 8),
                 Container(
