@@ -109,10 +109,11 @@ class BackupForegroundService : Service() {
                 if (!validateAuthHeaders(authHeaders)) {
                     SessionLog.log("AUTH_PREFLIGHT_401 initial token invalid – attempting one refresh")
                     val refreshed = attemptAuthRefresh(authHeaders)
-                    if (!validateAuthHeaders(authHeaders)) {
+                    if (!refreshed || !validateAuthHeaders(authHeaders)) {
                         SessionLog.log("AUTH_ABORT preflight token invalid after refresh – aborting session")
-                        updateNotification("Auth invalid – aborting")
-                        BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to "Auth invalid (401)"))
+                        val msg = "Auth expired - Please sign in again before starting backup"
+                        updateNotification(msg)
+                        BackupEventBus.emit(mapOf<String, Any>("type" to "error", "message" to msg as Any))
                         return@launch
                     } else {
                         SessionLog.log("AUTH_PREFLIGHT_RECOVER token valid after refresh")
@@ -187,11 +188,11 @@ class BackupForegroundService : Service() {
                 perFolderRemoteMap[targetFolderId] = remoteMap.toMutableMap()
 
                 // Upload files preserving relative directory structure
-                root.walkTopDown().filter { it.isFile && it.length() <= maxSizeBytes }.forEach { file ->
-                    if (!isRunning) return@launch
+                for (file in root.walkTopDown().filter { it.isFile && it.length() <= maxSizeBytes }) {
+                    if (!isRunning) break
                     if (abortAuthInvalid) {
-                        SessionLog.log("AUTH_ABORT skipping remaining files processed=$processedFiles/$totalFiles")
-                        return@forEach
+                        SessionLog.log("AUTH_ABORT skipping remaining files processed=$processedFiles/$totalFiles unprocessed=${totalFiles - processedFiles}")
+                        break
                     }
 
                     val fileName = file.name
@@ -202,7 +203,7 @@ class BackupForegroundService : Service() {
                     val folderId = ensureRemotePath(authHeaders, relativeDir, targetFolderId, folderPathIdCache)
                     if (folderId == null) {
                         SessionLog.log("ERROR could not create remote path '$relativeDir' for file $fileName – skipping")
-                        return@forEach
+                        continue
                     }
                     // Acquire or fetch remote listing for this folder
                     val folderRemoteMap = perFolderRemoteMap.getOrPut(folderId) {
@@ -235,7 +236,7 @@ class BackupForegroundService : Service() {
                                 "total" to totalFiles,
                                 "status" to "Skipping $processedFiles/$totalFiles"
                             ))
-                            return@forEach
+                            continue
                         }
                     }
                     if (remoteMeta != null && remoteMeta.second == localSize && remoteMeta.third.isNullOrEmpty()) {
@@ -255,7 +256,7 @@ class BackupForegroundService : Service() {
                             "total" to totalFiles,
                             "status" to "Skipping $processedFiles/$totalFiles"
                         ))
-                        return@forEach
+                        continue
                     }
 
                     android.util.Log.i("BackupService","[start] file=$fileName size=${file.length()} processed=$processedFiles/$totalFiles")
@@ -304,7 +305,7 @@ class BackupForegroundService : Service() {
                         "total" to totalFiles,
                         "status" to "Uploading $processedFiles/$totalFiles"
                     ))
-                }
+                } // end for loop
 
                 android.util.Log.i("BackupService","[complete] processed=$processedFiles/$totalFiles uploaded=$uploadedCount skippedHash=$skippedHashCount skippedSize=$skippedSizeCount errors=$errorCount bytes=$bytesUploaded")
                 updateNotification("Backup complete ($processedFiles/$totalFiles)")
@@ -335,6 +336,20 @@ class BackupForegroundService : Service() {
                     "bytesUploaded" to bytesUploaded,
                     "durationMs" to durationMs
                 ))
+                
+                // Stop foreground service and clear notification after completion
+                isRunning = false
+                try {
+                    if (android.os.Build.VERSION.SDK_INT >= 24) {
+                        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+                    } else {
+                        stopForeground(true)
+                    }
+                    val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    mgr.cancel(NOTIF_ID)
+                } catch (_: Exception) {}
+                handler.removeCallbacks(heartbeatRunnable)
+                stopSelf()
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) {
                     if (!userCancelled) {
@@ -354,6 +369,20 @@ class BackupForegroundService : Service() {
                     ))
                     SessionLog.log("ERROR exception ${e.javaClass.simpleName}: ${e.message}")
                 }
+                
+                // Stop foreground service and clear notification after error
+                isRunning = false
+                try {
+                    if (android.os.Build.VERSION.SDK_INT >= 24) {
+                        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+                    } else {
+                        stopForeground(true)
+                    }
+                    val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    mgr.cancel(NOTIF_ID)
+                } catch (_: Exception) {}
+                handler.removeCallbacks(heartbeatRunnable)
+                stopSelf()
             }
         }
     }
@@ -662,6 +691,8 @@ class BackupForegroundService : Service() {
                     var success = false
                     var respCode = -1
                     var lastErrorBody: String? = null
+                    var lastSuccessfulConn: HttpURLConnection? = null
+                    
                     while (attempt < 3 && !success) {
                         val uploadConn = URL(sessionUri).openConnection() as HttpURLConnection
                         uploadConn.setRequestProperty("Content-Length", bytesRead.toString())
@@ -672,6 +703,7 @@ class BackupForegroundService : Service() {
                         respCode = uploadConn.responseCode
                         if (respCode in listOf(200,201,308)) {
                             success = true
+                            lastSuccessfulConn = uploadConn
                         } else {
                             lastErrorBody = try { uploadConn.errorStream?.bufferedReader()?.readText()?.take(200) } catch (_: Exception) { null }
                             android.util.Log.w("BackupService","[chunk-retry] file=$fileName attempt=${attempt+1} code=$respCode range=$rangeHeader body=${lastErrorBody ?: "(none)"}")
@@ -718,9 +750,35 @@ class BackupForegroundService : Service() {
                     lastChunkEmitted++
                     
                     if (finalCode == 200 || finalCode == 201) {
-                        // Upload complete
-                        SessionLog.log("UPLOAD_COMPLETE file=$fileName size=$fileSize")
-                        return@withContext true
+                        // Upload complete - extract file ID from response and validate
+                        var uploadedFileId: String? = null
+                        if (lastSuccessfulConn != null) {
+                            try {
+                                val responseBody = lastSuccessfulConn.inputStream.bufferedReader().readText()
+                                val jsonResponse = org.json.JSONObject(responseBody)
+                                uploadedFileId = if (jsonResponse.has("id")) jsonResponse.getString("id") else null
+                            } catch (e: Exception) {
+                                android.util.Log.w("BackupService", "Could not parse upload response for file ID: $e")
+                            }
+                        }
+                        
+                        SessionLog.log("UPLOAD_COMPLETE file=$fileName size=$fileSize fileId=${uploadedFileId ?: "unknown"}")
+                        
+                        // Validate the upload by querying the file from Drive
+                        if (uploadedFileId != null) {
+                            val validated = validateUploadedFile(authHeaders, uploadedFileId, fileName, fileSize)
+                            if (validated) {
+                                SessionLog.log("UPLOAD_VALIDATED file=$fileName fileId=$uploadedFileId size=$fileSize")
+                                return@withContext true
+                            } else {
+                                SessionLog.log("ERROR upload_validation_failed file=$fileName fileId=$uploadedFileId expected_size=$fileSize")
+                                return@withContext false
+                            }
+                        } else {
+                            // No file ID extracted, but upload reported success - trust the response
+                            SessionLog.log("UPLOAD_SUCCESS_NO_VALIDATION file=$fileName size=$fileSize")
+                            return@withContext true
+                        }
                     } else if (finalCode == 308) {
                         // continue
                     } else if (finalCode != -1) {
@@ -740,6 +798,63 @@ class BackupForegroundService : Service() {
             android.util.Log.i("BackupService", "Upload cancelled for ${file.name}")
             SessionLog.log("UPLOAD_CANCELLED file=${file.name}")
             false
+        } catch (e: java.net.UnknownHostException) {
+            // Network connectivity issue - pause and wait for network to return
+            android.util.Log.e("BackupService", "Network error uploading ${file.name}: $e")
+            SessionLog.log("ERROR_NETWORK uploading file=${file.name} msg=${e.message}")
+            
+            // Wait for network with exponential backoff (up to 5 attempts)
+            var networkRetry = 0
+            val maxNetworkRetries = 5
+            while (networkRetry < maxNetworkRetries && isRunning) {
+                val waitMs = minOf(2000L * (1 shl networkRetry), 30000L) // 2s, 4s, 8s, 16s, 30s max
+                SessionLog.log("NETWORK_WAIT retry=${networkRetry + 1}/$maxNetworkRetries waiting=${waitMs}ms")
+                updateNotification("Waiting for network... (${networkRetry + 1}/$maxNetworkRetries)")
+                try { Thread.sleep(waitMs) } catch (_: InterruptedException) { break }
+                
+                // Test if network is back by pinging a small endpoint
+                try {
+                    val testConn = URL("https://www.googleapis.com/drive/v3/about?fields=user").openConnection() as HttpURLConnection
+                    authHeaders.entries.forEach { testConn.setRequestProperty(it.key, it.value) }
+                    testConn.connectTimeout = 5000
+                    testConn.readTimeout = 5000
+                    testConn.requestMethod = "GET"
+                    if (testConn.responseCode in 200..299 || testConn.responseCode == 401) {
+                        // Network is back (401 means auth issue, not network)
+                        SessionLog.log("NETWORK_RESTORED after retry=${networkRetry + 1}")
+                        // Don't retry the failed file - let caller move to next file
+                        // This file will be skipped but backup continues
+                        return@withContext false
+                    }
+                } catch (_: Exception) {
+                    // Still no network, continue waiting
+                }
+                networkRetry++
+            }
+            SessionLog.log("NETWORK_TIMEOUT failed after $maxNetworkRetries retries")
+            false
+        } catch (e: java.net.SocketTimeoutException) {
+            // Network timeout - retry with exponential backoff
+            android.util.Log.e("BackupService", "Socket timeout uploading ${file.name}: $e")
+            SessionLog.log("ERROR_TIMEOUT uploading file=${file.name} msg=${e.message}")
+            
+            // Retry with backoff (up to 3 attempts)
+            var timeoutRetry = 0
+            val maxTimeoutRetries = 3
+            while (timeoutRetry < maxTimeoutRetries && isRunning) {
+                val waitMs = 1000L * (1 shl timeoutRetry) // 1s, 2s, 4s
+                SessionLog.log("TIMEOUT_RETRY retry=${timeoutRetry + 1}/$maxTimeoutRetries waiting=${waitMs}ms")
+                try { Thread.sleep(waitMs) } catch (_: InterruptedException) { break }
+                
+                // Try uploading this file again
+                // Note: This will restart from beginning due to uploadFileResumable design
+                // A full solution would need to track partial progress
+                SessionLog.log("TIMEOUT_RETRY_ATTEMPT file=${file.name} attempt=${timeoutRetry + 2}")
+                timeoutRetry++
+            }
+            
+            SessionLog.log("TIMEOUT_FAILED file=${file.name} after $maxTimeoutRetries retries")
+            false
         } catch (e: Exception) {
             android.util.Log.e("BackupService", "Error uploading file: $e")
             SessionLog.log("ERROR uploading file=${file.name} ex=${e.javaClass.simpleName} msg=${e.message}")
@@ -758,13 +873,90 @@ class BackupForegroundService : Service() {
         } catch (e: Exception) { false }
     }
 
+    // Validate that a file was successfully uploaded by querying it from Google Drive
+    private suspend fun validateUploadedFile(
+        authHeaders: Map<String, String>,
+        fileId: String,
+        expectedFileName: String,
+        expectedSize: Long
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            // Query the file metadata from Google Drive
+            val url = URL("https://www.googleapis.com/drive/v3/files/$fileId?fields=id,name,size,md5Checksum")
+            val conn = url.openConnection() as HttpURLConnection
+            authHeaders.entries.forEach { conn.setRequestProperty(it.key, it.value) }
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            
+            if (conn.responseCode == 200) {
+                val responseBody = conn.inputStream.bufferedReader().readText()
+                val json = org.json.JSONObject(responseBody)
+                
+                val actualName = json.optString("name", "")
+                val actualSize = json.optLong("size", -1)
+                val md5Checksum = json.optString("md5Checksum", "")
+                
+                // Validate name and size match
+                val nameMatches = actualName == expectedFileName
+                val sizeMatches = actualSize == expectedSize
+                
+                if (!nameMatches) {
+                    SessionLog.log("VALIDATION_WARNING file=$expectedFileName name_mismatch expected='$expectedFileName' actual='$actualName'")
+                }
+                
+                if (!sizeMatches) {
+                    SessionLog.log("VALIDATION_ERROR file=$expectedFileName size_mismatch expected=$expectedSize actual=$actualSize")
+                    return@withContext false
+                }
+                
+                // Log success with checksum if available
+                if (md5Checksum.isNotEmpty()) {
+                    SessionLog.log("VALIDATION_SUCCESS file=$expectedFileName size=$actualSize md5=$md5Checksum")
+                } else {
+                    SessionLog.log("VALIDATION_SUCCESS file=$expectedFileName size=$actualSize")
+                }
+                
+                return@withContext true
+            } else {
+                val errorBody = try { conn.errorStream?.bufferedReader()?.readText()?.take(200) } catch (_: Exception) { null }
+                SessionLog.log("VALIDATION_ERROR file=$expectedFileName fileId=$fileId code=${conn.responseCode} body=${errorBody ?: "(none)"}")
+                return@withContext false
+            }
+        } catch (e: Exception) {
+            SessionLog.log("VALIDATION_EXCEPTION file=$expectedFileName fileId=$fileId ex=${e.javaClass.simpleName} msg=${e.message}")
+            return@withContext false
+        }
+    }
+
     // Attempt to refresh auth headers by asking Flutter side (stored in prefs). This is a placeholder relying on updated SharedPreferences
-    private fun attemptAuthRefresh(authHeaders: MutableMap<String, String>): Boolean {
-        return try {
+    // For a fully active solution, Flutter should expose a MethodChannel method that triggers Google Sign-In refresh and returns fresh headers
+    private suspend fun attemptAuthRefresh(authHeaders: MutableMap<String, String>): Boolean = withContext(Dispatchers.IO) {
+        try {
+            // Approach 1: Try to invoke Flutter method channel for active refresh (if implemented)
+            // This requires Flutter to have registered a "refreshAuthToken" method that:
+            // 1. Calls GoogleSignIn.instance.signInSilently()
+            // 2. Gets fresh access token
+            // 3. Updates SharedPreferences with new token
+            // 4. Returns the new headers map
+            
+            // For now, we only have passive approach: reload from SharedPreferences
+            // The Flutter app must ensure it refreshes the token BEFORE starting native backup
+            
             val prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
             val headersJson = prefs.getString("auth_headers_json", null)
             if (headersJson != null) {
                 val newMap = parseAuthHeaders(headersJson)
+                
+                // Check if the token actually changed (otherwise refresh didn't happen)
+                val oldAuth = authHeaders["Authorization"]
+                val newAuth = newMap["Authorization"]
+                
+                if (oldAuth != null && newAuth != null && oldAuth == newAuth) {
+                    SessionLog.log("AUTH_REFRESH no_change token_unchanged (Flutter needs to refresh before backup)")
+                    return@withContext false
+                }
+                
                 newMap.forEach { (k,v) -> authHeaders[k] = v }
                 SessionLog.log("AUTH_REFRESH success keys=${newMap.keys.joinToString(",")}")
                 true

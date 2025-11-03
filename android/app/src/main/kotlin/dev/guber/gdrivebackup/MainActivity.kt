@@ -198,6 +198,19 @@ class MainActivity : FlutterActivity() {
                         if (txt == null) result.error("NOT_FOUND", "File not found", null) else result.success(txt)
                     }
                 }
+                "deleteSessionLogFile" -> {
+                    val name = call.argument<String>("name")
+                    if (name.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "name missing", null)
+                    } else {
+                        try {
+                            val deleted = SessionLog.deleteLogFile(filesDir, name)
+                            if (deleted) result.success(true) else result.error("NOT_FOUND", "File not found", null)
+                        } catch (e: Exception) {
+                            result.error("DELETE_FAILED", e.message, null)
+                        }
+                    }
+                }
                 "setLogLevel" -> {
                     val level = call.argument<String>("level")
                     if (level == null) {

@@ -128,4 +128,15 @@ object SessionLog {
             null
         }
     }
+
+    fun deleteLogFile(dir: File, name: String): Boolean {
+        return try {
+            val f = File(dir, name)
+            if (!f.exists()) return false
+            f.delete()
+        } catch (e: Exception) {
+            android.util.Log.e("SessionLog", "delete error ${e.message}")
+            false
+        }
+    }
 }

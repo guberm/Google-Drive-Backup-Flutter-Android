@@ -354,6 +354,33 @@ class _BackupHomePageState extends State<BackupHomePage>
     }
   }
 
+  Future<void> _deleteHistoricalLog(String name) async {
+    const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
+    try {
+      await platform.invokeMethod('deleteSessionLogFile', {'name': name});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Deleted $name')),
+        );
+        // If we're viewing the deleted log, clear it
+        if (_selectedHistoricalLogName == name) {
+          setState(() {
+            _sessionLog = '';
+            _showSessionLog = false;
+            _selectedHistoricalLogName = null;
+          });
+        }
+      }
+    } catch (e) {
+      print('Failed to delete log: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to delete: $e')),
+        );
+      }
+    }
+  }
+
   // Share current (or selected historical) session log as a file attachment.
   // This avoids freezing the UI when the log is very large by not passing a huge text payload
   // through the platform share intent. If the log exceeds 64KB, gzip compress it.
@@ -1233,8 +1260,20 @@ class _BackupHomePageState extends State<BackupHomePage>
     // For now, use native mode if available (prefer service-based upload)
     if (_useNativeBackup) {
       try {
-        // Pass auth headers to native
-        final authHeaders = await _currentUser!.authHeaders;
+        // CRITICAL: Refresh token BEFORE starting backup to avoid auth failures
+        // silentSignIn() will refresh the token if it's expired
+        print('Refreshing auth token before backup...');
+        final refreshedUser =
+            await _googleSignIn.signInSilently(reAuthenticate: true);
+        if (refreshedUser == null) {
+          throw Exception(
+              'Failed to refresh auth token - please sign in again');
+        }
+
+        // Get fresh auth headers (includes refreshed access token)
+        final authHeaders = await refreshedUser.authHeaders;
+        print('Got fresh auth headers for backup');
+
         const platform = MethodChannel('dev.guber.gdrivebackup/wakelock');
         await platform.invokeMethod('setAuthHeaders', {'headers': authHeaders});
 
@@ -1856,7 +1895,152 @@ class _BackupHomePageState extends State<BackupHomePage>
                   const SizedBox(width: 12),
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: _refreshHistoricalLogs,
+                      onPressed: () async {
+                        await _refreshHistoricalLogs();
+                        if (!mounted) return;
+                        if (_historicalLogs.isEmpty) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text('No historical logs found')),
+                          );
+                          return;
+                        }
+                        showModalBottomSheet(
+                          context: context,
+                          showDragHandle: true,
+                          builder: (ctx) {
+                            return SafeArea(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Padding(
+                                    padding: const EdgeInsets.all(16.0),
+                                    child: Row(
+                                      children: [
+                                        const Icon(Icons.history),
+                                        const SizedBox(width: 8),
+                                        const Text('Historical Logs',
+                                            style: TextStyle(
+                                                fontSize: 16,
+                                                fontWeight: FontWeight.bold)),
+                                        const Spacer(),
+                                        IconButton(
+                                          onPressed: () => Navigator.pop(ctx),
+                                          icon: const Icon(Icons.close),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  if (_loadingHistorical)
+                                    const Padding(
+                                      padding: EdgeInsets.all(16.0),
+                                      child: Center(
+                                        child: CircularProgressIndicator(),
+                                      ),
+                                    )
+                                  else
+                                    Expanded(
+                                      child: ListView.builder(
+                                        itemCount: _historicalLogs.length,
+                                        itemBuilder: (c, i) {
+                                          final e = _historicalLogs[i];
+                                          final name =
+                                              e['name'] as String? ?? '';
+                                          final size = e['size'] as int? ?? 0;
+                                          final modified = DateTime
+                                              .fromMillisecondsSinceEpoch(
+                                                  (e['modified'] as int?) ?? 0);
+                                          return ListTile(
+                                            dense: true,
+                                            title: Text(name,
+                                                style: const TextStyle(
+                                                    fontSize: 13)),
+                                            subtitle: Text(
+                                              '${_formatBytes(size)}  •  ${modified.toLocal().toString().split('.').first}',
+                                              style:
+                                                  const TextStyle(fontSize: 11),
+                                            ),
+                                            leading: const Icon(
+                                              Icons.description_outlined,
+                                              size: 18,
+                                            ),
+                                            trailing: IconButton(
+                                              icon: const Icon(
+                                                  Icons.delete_outline,
+                                                  size: 20,
+                                                  color: Colors.red),
+                                              onPressed: () async {
+                                                final confirm =
+                                                    await showDialog<bool>(
+                                                  context: ctx,
+                                                  builder: (dialogCtx) =>
+                                                      AlertDialog(
+                                                    title: const Text(
+                                                        'Delete Log'),
+                                                    content: Text(
+                                                        'Delete "$name"?\nThis cannot be undone.'),
+                                                    actions: [
+                                                      TextButton(
+                                                        onPressed: () =>
+                                                            Navigator.pop(
+                                                                dialogCtx,
+                                                                false),
+                                                        child: const Text(
+                                                            'Cancel'),
+                                                      ),
+                                                      TextButton(
+                                                        onPressed: () =>
+                                                            Navigator.pop(
+                                                                dialogCtx,
+                                                                true),
+                                                        child: const Text(
+                                                            'Delete',
+                                                            style: TextStyle(
+                                                                color: Colors
+                                                                    .red)),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                );
+                                                if (confirm == true) {
+                                                  await _deleteHistoricalLog(
+                                                      name);
+                                                  await _refreshHistoricalLogs();
+                                                  if (ctx.mounted) {
+                                                    // Force rebuild of the modal
+                                                    Navigator.pop(ctx);
+                                                    // Reopen if there are still logs
+                                                    if (_historicalLogs
+                                                            .isNotEmpty &&
+                                                        context.mounted) {
+                                                      // Recursively call to reopen
+                                                      Future.delayed(
+                                                          const Duration(
+                                                              milliseconds:
+                                                                  100), () {
+                                                        if (mounted) {
+                                                          setState(() {});
+                                                        }
+                                                      });
+                                                    }
+                                                  }
+                                                }
+                                              },
+                                            ),
+                                            onTap: () {
+                                              Navigator.pop(ctx);
+                                              _openHistoricalLog(name);
+                                            },
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            );
+                          },
+                        );
+                      },
                       icon: const Icon(Icons.history),
                       label: const Text('History'),
                     ),
@@ -1879,89 +2063,6 @@ class _BackupHomePageState extends State<BackupHomePage>
                               )
                             : const Icon(Icons.share),
                         label: Text(_sharingLog ? 'Sharing...' : 'Share Log'),
-                      ),
-                    ),
-                  if (_historicalLogs.isNotEmpty)
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: () async {
-                          if (!mounted) return;
-                          showModalBottomSheet(
-                            context: context,
-                            showDragHandle: true,
-                            builder: (ctx) {
-                              return SafeArea(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Padding(
-                                      padding: const EdgeInsets.all(16.0),
-                                      child: Row(
-                                        children: [
-                                          const Icon(Icons.history),
-                                          const SizedBox(width: 8),
-                                          const Text('Historical Logs',
-                                              style: TextStyle(
-                                                  fontSize: 16,
-                                                  fontWeight: FontWeight.bold)),
-                                          const Spacer(),
-                                          IconButton(
-                                            onPressed: () => Navigator.pop(ctx),
-                                            icon: const Icon(Icons.close),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    if (_loadingHistorical)
-                                      const Padding(
-                                        padding: EdgeInsets.all(16.0),
-                                        child: Center(
-                                          child: CircularProgressIndicator(),
-                                        ),
-                                      )
-                                    else
-                                      Expanded(
-                                        child: ListView.builder(
-                                          itemCount: _historicalLogs.length,
-                                          itemBuilder: (c, i) {
-                                            final e = _historicalLogs[i];
-                                            final name =
-                                                e['name'] as String? ?? '';
-                                            final size = e['size'] as int? ?? 0;
-                                            final modified = DateTime
-                                                .fromMillisecondsSinceEpoch(
-                                                    (e['modified'] as int?) ??
-                                                        0);
-                                            return ListTile(
-                                              dense: true,
-                                              title: Text(name,
-                                                  style: const TextStyle(
-                                                      fontSize: 13)),
-                                              subtitle: Text(
-                                                '${_formatBytes(size)}  •  ${modified.toLocal().toString().split('.').first}',
-                                                style: const TextStyle(
-                                                    fontSize: 11),
-                                              ),
-                                              leading: const Icon(
-                                                Icons.description_outlined,
-                                                size: 18,
-                                              ),
-                                              onTap: () {
-                                                Navigator.pop(ctx);
-                                                _openHistoricalLog(name);
-                                              },
-                                            );
-                                          },
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              );
-                            },
-                          );
-                        },
-                        icon: const Icon(Icons.history),
-                        label: const Text('History'),
                       ),
                     ),
                   if (_showSessionLog && _sessionLog.isNotEmpty)
